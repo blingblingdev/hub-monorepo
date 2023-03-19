@@ -89,8 +89,8 @@ COPY --from=app / /
 
 # Repeat of above since it is lost between build stages
 USER node
-EXPOSE 33380
-EXPOSE 33390
+EXPOSE 32280
+EXPOSE 32290
 WORKDIR /home/node/app
 
-CMD ["yarn", "--cwd=apps/hubble", "start", "--rpc-port", "33380", "--ip", "0.0.0.0", "--gossip-port", "33390", "--eth-rpc-url", "https://eth-goerli.g.alchemy.com/v2/KqEbo9pahkUx1oIiLapHK3pWyyEAxmLb", "--network", "1"]
+CMD ["yarn", "--cwd=apps/hubble", "start", "--rpc-port", "32280", "--ip", "0.0.0.0", "--gossip-port", "32290", "--eth-rpc-url", "https://eth-goerli.g.alchemy.com/v2/KqEbo9pahkUx1oIiLapHK3pWyyEAxmLb", "--network", "1"]
