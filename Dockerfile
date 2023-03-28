@@ -94,4 +94,4 @@ EXPOSE 32282
 EXPOSE 32283
 WORKDIR /home/node/app
 
-CMD ["yarn", "--cwd=apps/hubble", "start", "--rpc-port", "32282", "--ip", "0.0.0.0", "--gossip-port", "32283", "--eth-rpc-url", "https://eth-goerli.g.alchemy.com/v2/KqEbo9pahkUx1oIiLapHK3pWyyEAxmLb", "-b", "/dns/testnet1.farcaster.xyz/tcp/2282", "--network", "2", "--allowed-peers", "none"]
+CMD ["yarn", "--cwd=apps/hubble", "start", "--rpc-port", "32282", "--ip", "0.0.0.0", "--gossip-port", "32283", "--eth-rpc-url", "https://eth-goerli.g.alchemy.com/v2/KqEbo9pahkUx1oIiLapHK3pWyyEAxmLb", "-b", "/dns/testnet1.farcaster.xyz/tcp/2282", "--network", "2"]
