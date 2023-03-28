@@ -1,15 +1,15 @@
 # Examples
 
-Each example is a fully executable javascript package that can be checked out and executed, along with a link to a corresponding replit.
+A collection of Typescript examples showcasing the things you can do with `hub-nodejs`. Each example is a self-
+contained repository that includes a StackBlitz link to run it in a cloud REPL.
 
-## Reading Data
+- [Generate a chronological feed](./chron-feed/)
+- [Writing data for a user](./write-data/)
+- [Building casts correctly](./make-cast/)
 
-- Generate a chronological feed
+Other examples that should be added:
+
 - Subscribe to updates about a user
-- Handle Signer Changes
+- Rotating signers without losing messages
 
-## Writing Data
-
-- [Create Signers to publish messages](./write-signer.md)
-- Create new Casts
-- Create new Reactions
+Contributions for these examples and more are welcome!

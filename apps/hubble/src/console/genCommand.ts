@@ -1,5 +1,5 @@
 import * as protobufs from '@farcaster/protobufs';
-import { AdminRpcClient, Factories, HubRpcClient } from '@farcaster/utils';
+import { AdminRpcClient, Factories, getAuthMetadata, HubRpcClient } from '@farcaster/utils';
 import { ConsoleCommandInterface } from './console';
 
 // We use console.log() in this file, so we disable the eslint rule. This is the REPL console, after all!
@@ -38,20 +38,24 @@ export class GenCommand implements ConsoleCommandInterface {
       submitMessages: async (
         numMessages = 100,
         network = protobufs.FarcasterNetwork.DEVNET,
-        username?: string,
+        username?: string | protobufs.Metadata,
         password?: string
       ): Promise<string | SubmitStats> => {
         // Submit messages might need a username/password
-        const metadata = new protobufs.Metadata();
-        if (username && password) {
-          metadata.set('authorization', `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`);
+        let metadata = new protobufs.Metadata();
+        if (username && typeof username !== 'string') {
+          metadata = username;
+        } else if (username && password) {
+          metadata = getAuthMetadata(username, password);
         }
 
         // Generate a random number from 100_000 to 100_000_000 to use as an fid
         const fid = Math.floor(Math.random() * 100_000_000 + 100_000);
 
-        const custodySigner = await Factories.Eip712Signer.create();
+        const custodySigner = Factories.Eip712Signer.build();
+        const custodySignerKey = (await custodySigner.getSignerKey())._unsafeUnwrap();
         const signer = Factories.Ed25519Signer.build();
+        const signerKey = (await signer.getSignerKey())._unsafeUnwrap();
 
         let numSuccess = 0;
         let numFail = 0;
@@ -59,8 +63,8 @@ export class GenCommand implements ConsoleCommandInterface {
 
         const start = performance.now();
 
-        const custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySigner.signerKey });
-        const idResult = await this.adminRpcClient.submitIdRegistryEvent(custodyEvent);
+        const custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySignerKey });
+        const idResult = await this.adminRpcClient.submitIdRegistryEvent(custodyEvent, metadata);
         if (idResult.isOk()) {
           numSuccess++;
         } else {
@@ -68,7 +72,7 @@ export class GenCommand implements ConsoleCommandInterface {
         }
 
         const signerAdd = await Factories.SignerAddMessage.create(
-          { data: { fid, network, signerAddBody: { signer: signer.signerKey } } },
+          { data: { fid, network, signerAddBody: { signer: signerKey } } },
           { transient: { signer: custodySigner } }
         );
 

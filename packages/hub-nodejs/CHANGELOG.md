@@ -1,5 +1,55 @@
 # @farcaster/hub-nodejs
 
+## 0.6.0
+
+### Minor Changes
+
+- e5cb327: Remove getHubRpcClient, use getSSLRpcClient() or getInsecureRpcClient()
+
+### Patch Changes
+
+- Updated dependencies [e5cb327]
+  - @farcaster/protobufs@0.1.11
+  - @farcaster/utils@0.4.0
+
+## 0.5.1
+
+### Patch Changes
+
+- c26fafa: Add test data to testnet hubs via TEST_USERS env variable
+- dc69b66: feat: add EthersV5Eip712Signer
+- 5c78405: upgrade ethers to 6.2.1
+- 1b5f6b2: fixed documentation links on npm
+- Updated dependencies [12c9c40]
+- Updated dependencies [dc69b66]
+- Updated dependencies [5c78405]
+- Updated dependencies [6a0bf29]
+- Updated dependencies [23de6e7]
+  - @farcaster/utils@0.3.1
+  - @farcaster/protobufs@0.1.10
+
+## 0.5.0
+
+### Minor Changes
+
+- 59920f9: upgrade ethers from v5 to v6
+- 99518ef: refactor: generic and library specific signer classes
+
+  - `Eip712Signer` has been renamed to `EthersEip712Signer` and should be built with `new EthersEip712Signer(wallet)` instead of `Eip712Signer.fromSigner`
+  - `Ed25519Signer` has been renamed to `NobleEd25519Signer` and should be built with `new NobleEd25519Signer(privateKey)` instead of `Ed25519Signer.fromPrivateKey`
+
+### Patch Changes
+
+- c459855: docs: update signer links in docs
+- 1e4482e: updated dependencies
+- Updated dependencies [469825e]
+- Updated dependencies [1b0e3a7]
+- Updated dependencies [59920f9]
+- Updated dependencies [99518ef]
+- Updated dependencies [1e4482e]
+  - @farcaster/protobufs@0.1.9
+  - @farcaster/utils@0.3.0
+
 ## 0.4.1
 
 ### Patch Changes

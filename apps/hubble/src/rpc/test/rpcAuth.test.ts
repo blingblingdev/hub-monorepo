@@ -1,11 +1,13 @@
 import * as protobufs from '@farcaster/protobufs';
-import { Eip712Signer, Factories, getInsecureHubRpcClient, HubError } from '@farcaster/utils';
+import { RateLimiterMemory } from 'rate-limiter-flexible';
+import { Factories, getInsecureHubRpcClient, HubError } from '@farcaster/utils';
 import SyncEngine from '~/network/sync/syncEngine';
 
-import Server from '~/rpc/server';
+import Server, { rateLimitByIp } from '~/rpc/server';
 import { jestRocksDB } from '~/storage/db/jestUtils';
 import Engine from '~/storage/engine';
 import { MockHub } from '~/test/mocks';
+import { sleep } from '~/utils/crypto';
 
 const db = jestRocksDB('protobufs.rpcAuth.test');
 const network = protobufs.FarcasterNetwork.TESTNET;
@@ -14,19 +16,24 @@ const hub = new MockHub(db, engine);
 
 const fid = Factories.Fid.build();
 const signer = Factories.Ed25519Signer.build();
+const custodySigner = Factories.Eip712Signer.build();
 
-let custodySigner: Eip712Signer;
 let custodyEvent: protobufs.IdRegistryEvent;
-let signerAdd: protobufs.Message;
+let signerAdd: protobufs.SignerAddMessage;
 
 beforeAll(async () => {
-  custodySigner = await Factories.Eip712Signer.create();
-  custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySigner.signerKey });
+  const signerKey = (await signer.getSignerKey())._unsafeUnwrap();
+  const custodySignerKey = (await custodySigner.getSignerKey())._unsafeUnwrap();
+  custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySignerKey });
 
   signerAdd = await Factories.SignerAddMessage.create(
-    { data: { fid, network, signerAddBody: { signer: signer.signerKey } } },
+    { data: { fid, network, signerAddBody: { signer: signerKey } } },
     { transient: { signer: custodySigner } }
   );
+});
+
+afterAll(async () => {
+  await engine.stop();
 });
 
 describe('auth tests', () => {
@@ -87,5 +94,31 @@ describe('auth tests', () => {
 
     await authServer.stop();
     authClient.$.close();
+  });
+
+  test('test rate limiting', async () => {
+    const Limit10PerSecond = new RateLimiterMemory({
+      points: 10,
+      duration: 1,
+    });
+
+    // 10 Requests should be fine
+    for (let i = 0; i < 10; i++) {
+      const result = await rateLimitByIp('testip:3000', Limit10PerSecond);
+      expect(result.isOk()).toBeTruthy();
+    }
+
+    // Sleep for 1 second to reset the rate limiter
+    await sleep(1100);
+
+    // 11th+ request should fail
+    for (let i = 0; i < 20; i++) {
+      const result = await rateLimitByIp('testip:3000', Limit10PerSecond);
+      if (i < 10) {
+        expect(result.isOk()).toBeTruthy();
+      } else {
+        expect(result._unsafeUnwrapErr().message).toEqual('Too many requests');
+      }
+    }
   });
 });

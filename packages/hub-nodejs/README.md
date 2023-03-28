@@ -9,7 +9,7 @@ A lightweight, fast Typescript interface for Farcaster Hubs. Designed to work wi
 - Has helpers to create and sign Farcaster messages.
 - Written entirely in TypeScript, with strict types for safety.
 
-Read the [documentation](./docs/README.md), see more [examples](./examples/) or get started with the guide below.
+Read the [documentation](https://github.com/farcasterxyz/hubble/tree/main/packages/hub-nodejs/docs), see more [examples](https://github.com/farcasterxyz/hubble/tree/main/packages/hub-nodejs/examples) or get started with the guide below.
 
 ## Installation
 
@@ -26,28 +26,20 @@ pnpm install @farcaster/hub-nodejs
 ### Fetching Data from Hubs
 
 ```typescript
-import { getHubRpcClient, isCastAddMessage } from '@farcaster/hub-nodejs';
+import { getInsecureHubRpcClient } from '@farcaster/hub-nodejs';
 
 (async () => {
-  const client = await getHubRpcClient('127.0.0.1:8080');
+  const client = getSSLHubRpcClient('testnet1.farcaster.xyz:2283');
 
   const castsResult = await client.getCastsByFid({ fid: 2 });
 
-  if (castsResult.isOk()) {
-    for (const cast of castsResult.value.messages) {
-      if (isCastAddMessage(cast)) {
-        console.log(cast.data.castAddBody.text);
-      }
-    }
-  } else {
-    console.log('Failed: ', castsResult.error);
-  }
+  castsResult.map((casts) => casts.messages.map((cast) => console.log(cast.data?.castAddBody?.text)));
 })();
 ```
 
 ## Contributing
 
-Please see our [contributing guidelines](../../../CONTRIBUTING.md) before making a pull request.
+Please see our [contributing guidelines](https://github.com/farcasterxyz/hubble/blob/main/CONTRIBUTING.md) before making a pull request.
 
 ## License
 

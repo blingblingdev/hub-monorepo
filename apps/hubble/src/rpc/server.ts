@@ -30,7 +30,7 @@ import {
   status,
 } from '@farcaster/protobufs';
 import { HubAsyncResult, HubError } from '@farcaster/utils';
-import { err, ok } from 'neverthrow';
+import { err, ok, Result } from 'neverthrow';
 import { APP_NICKNAME, APP_VERSION, HubInterface } from '~/hubble';
 import { GossipNode } from '~/network/p2p/gossipNode';
 import { NodeMetadata } from '~/network/sync/merkleTrie';
@@ -39,8 +39,54 @@ import Engine from '~/storage/engine';
 import { MessagesPage } from '~/storage/stores/types';
 import { logger } from '~/utils/logger';
 import { addressInfoFromParts } from '~/utils/p2p';
+import { RateLimiterMemory, RateLimiterAbstract } from 'rate-limiter-flexible';
 
 const log = logger.child({ component: 'rpcServer' });
+
+export const rateLimitByIp = async (ip: string, limiter: RateLimiterAbstract): HubAsyncResult<boolean> => {
+  // Get the IP part of the address
+  const ipPart = ip.split(':')[0] ?? '';
+
+  try {
+    await limiter.consume(ipPart);
+    return ok(true);
+  } catch (e) {
+    return err(new HubError('unavailable', 'Too many requests'));
+  }
+};
+
+// Check if the user is authenticated via the metadata
+export const authenticateUser = async (
+  metadata: Metadata,
+  rpcAuthUser?: string,
+  rpcAuthPass?: string
+): HubAsyncResult<boolean> => {
+  // If there is no auth user/pass, we don't need to authenticate
+  if (!rpcAuthUser || !rpcAuthPass) {
+    return ok(true);
+  }
+
+  if (metadata.get('authorization')) {
+    const authHeader = metadata.get('authorization')[0] as string;
+    if (!authHeader) {
+      return err(new HubError('unauthenticated', 'Authorization header is empty'));
+    }
+
+    const encodedCredentials = authHeader.replace('Basic ', '');
+    const decodedCredentials = Buffer.from(encodedCredentials, 'base64').toString('utf-8');
+    const [username, password] = decodedCredentials.split(':');
+    if (!username || !password) {
+      return err(new HubError('unauthenticated', `Invalid username: ${username}`));
+    }
+
+    if (username === rpcAuthUser && password === rpcAuthPass) {
+      return ok(true);
+    } else {
+      return err(new HubError('unauthenticated', `Invalid password for user: ${username}`));
+    }
+  }
+  return err(new HubError('unauthenticated', 'No authorization header'));
+};
 
 export const toServiceError = (err: HubError): ServiceError => {
   let grpcCode: number;
@@ -96,7 +142,16 @@ export default class Server {
   private rpcAuthUser: string | undefined;
   private rpcAuthPass: string | undefined;
 
-  constructor(hub?: HubInterface, engine?: Engine, syncEngine?: SyncEngine, gossipNode?: GossipNode, rpcAuth?: string) {
+  private submitMessageRateLimiter: RateLimiterMemory;
+
+  constructor(
+    hub?: HubInterface,
+    engine?: Engine,
+    syncEngine?: SyncEngine,
+    gossipNode?: GossipNode,
+    rpcAuth?: string,
+    rpcRateLimit?: number
+  ) {
     this.hub = hub;
     this.engine = engine;
     this.syncEngine = syncEngine;
@@ -114,6 +169,17 @@ export default class Server {
     }
 
     this.grpcServer.addService(HubServiceService, this.getImpl());
+
+    // Submit message are rate limited by default to 20k per minute
+    let rateLimitPerMinute = 20_000;
+    if (rpcRateLimit !== undefined && rpcRateLimit >= 0) {
+      rateLimitPerMinute = rpcRateLimit;
+    }
+
+    this.submitMessageRateLimiter = new RateLimiterMemory({
+      points: rateLimitPerMinute,
+      duration: 60,
+    });
   }
 
   async start(port = 0): Promise<number> {
@@ -158,33 +224,12 @@ export default class Server {
     return addr;
   }
 
-  // Check if the user is authenticated via the metadata
-  async authenticateUser(metadata: Metadata): HubAsyncResult<boolean> {
-    // If there is no auth user/pass, we don't need to authenticate
-    if (!this.rpcAuthUser || !this.rpcAuthPass) {
-      return ok(true);
-    }
+  get auth() {
+    return { user: this.rpcAuthUser, password: this.rpcAuthPass };
+  }
 
-    if (metadata.get('authorization')) {
-      const authHeader = metadata.get('authorization')[0] as string;
-      if (!authHeader) {
-        return err(new HubError('unauthenticated', 'Authorization header is empty'));
-      }
-
-      const encodedCredentials = authHeader.replace('Basic ', '');
-      const decodedCredentials = Buffer.from(encodedCredentials, 'base64').toString('utf-8');
-      const [username, password] = decodedCredentials.split(':');
-      if (!username || !password) {
-        return err(new HubError('unauthenticated', `Invalid username: ${username}`));
-      }
-
-      if (username === this.rpcAuthUser && password === this.rpcAuthPass) {
-        return ok(true);
-      } else {
-        return err(new HubError('unauthenticated', `Invalid password for user: ${username}`));
-      }
-    }
-    return err(new HubError('unauthenticated', 'No authorization header'));
+  get listenPort() {
+    return this.port;
   }
 
   getImpl = (): HubServiceServer => {
@@ -215,7 +260,20 @@ export default class Server {
         const messagesResult = await this.engine?.getAllMessagesBySyncIds(request.syncIds);
         messagesResult?.match(
           (messages) => {
-            callback(null, MessagesResponse.create({ messages: messages ?? [] }));
+            // Check the messages for corruption. If a message is blank, that means it was present
+            // in our sync trie, but the DB couldn't find it. So remove it from the sync Trie.
+            const corruptedMessages = messages.filter(
+              (message) => message.data === undefined || message.hash.length === 0
+            );
+
+            if (corruptedMessages.length > 0) {
+              log.warn({ num: corruptedMessages.length }, 'Found corrupted messages, rebuilding some syncIDs');
+              // Don't wait for this to finish, just return the messages we have.
+              this.syncEngine?.rebuildSyncIds(request.syncIds);
+              messages = messages.filter((message) => message.data !== undefined && message.hash.length > 0);
+            }
+
+            callback(null, MessagesResponse.create({ messages }));
           },
           (err: HubError) => {
             callback(toServiceError(err));
@@ -283,7 +341,28 @@ export default class Server {
         })();
       },
       submitMessage: async (call, callback) => {
-        const authResult = await this.authenticateUser(call.metadata);
+        // Identify peer that is calling, if available. This is used for rate limiting.
+        let peer;
+        const peerResult = Result.fromThrowable(
+          () => call.getPeer(),
+          (e) => e
+        )();
+        if (peerResult.isErr()) {
+          peer = 'unavailable'; // Catchall. If peer is unavailable, we will group all of them into one bucket
+        } else {
+          peer = peerResult.value;
+        }
+
+        // Check for rate limits
+        const rateLimitResult = await rateLimitByIp(peer, this.submitMessageRateLimiter);
+        if (rateLimitResult.isErr()) {
+          logger.warn({ peer }, 'submitMessage rate limited');
+          callback(toServiceError(new HubError('unavailable', 'API rate limit exceeded')));
+          return;
+        }
+
+        // Authentication
+        const authResult = await authenticateUser(call.metadata, this.rpcAuthUser, this.rpcAuthPass);
         if (authResult.isErr()) {
           logger.warn({ errMsg: authResult.error.message }, 'submitMessage failed');
           callback(toServiceError(new HubError('unauthenticated', 'User is not authenticated')));
@@ -320,11 +399,12 @@ export default class Server {
         );
       },
       getCastsByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
 
         const castsResult = await this.engine?.getCastsByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         castsResult?.match(
           (page: MessagesPage<CastAddMessage>) => {
@@ -336,9 +416,9 @@ export default class Server {
         );
       },
       getCastsByParent: async (call, callback) => {
-        const { castId, pageSize, pageToken } = call.request;
+        const { castId, pageSize, pageToken, reverse } = call.request;
 
-        const castsResult = await this.engine?.getCastsByParent(castId as CastId, { pageSize, pageToken });
+        const castsResult = await this.engine?.getCastsByParent(castId as CastId, { pageSize, pageToken, reverse });
         castsResult?.match(
           (page: MessagesPage<CastAddMessage>) => {
             callback(null, messagesPageToResponse(page));
@@ -349,9 +429,9 @@ export default class Server {
         );
       },
       getCastsByMention: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
 
-        const castsResult = await this.engine?.getCastsByMention(fid, { pageSize, pageToken });
+        const castsResult = await this.engine?.getCastsByMention(fid, { pageSize, pageToken, reverse });
         castsResult?.match(
           (page: MessagesPage<CastAddMessage>) => {
             callback(null, messagesPageToResponse(page));
@@ -379,10 +459,11 @@ export default class Server {
         );
       },
       getReactionsByFid: async (call, callback) => {
-        const { fid, reactionType, pageSize, pageToken } = call.request;
+        const { fid, reactionType, pageSize, pageToken, reverse } = call.request;
         const reactionsResult = await this.engine?.getReactionsByFid(fid, reactionType, {
           pageSize,
           pageToken,
+          reverse,
         });
         reactionsResult?.match(
           (page: MessagesPage<ReactionAddMessage>) => {
@@ -394,10 +475,11 @@ export default class Server {
         );
       },
       getReactionsByCast: async (call, callback) => {
-        const { castId, reactionType, pageSize, pageToken } = call.request;
+        const { castId, reactionType, pageSize, pageToken, reverse } = call.request;
         const reactionsResult = await this.engine?.getReactionsByCast(castId ?? CastId.create(), reactionType, {
           pageSize,
           pageToken,
+          reverse,
         });
         reactionsResult?.match(
           (page: MessagesPage<ReactionAddMessage>) => {
@@ -422,11 +504,12 @@ export default class Server {
         );
       },
       getUserDataByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
 
         const userDataResult = await this.engine?.getUserDataByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         userDataResult?.match(
           (page: MessagesPage<UserDataAddMessage>) => {
@@ -464,11 +547,12 @@ export default class Server {
         );
       },
       getVerificationsByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
 
         const verificationsResult = await this.engine?.getVerificationsByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         verificationsResult?.match(
           (page: MessagesPage<VerificationAddEthAddressMessage>) => {
@@ -493,10 +577,11 @@ export default class Server {
         );
       },
       getSignersByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
         const signersResult = await this.engine?.getSignersByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         signersResult?.match(
           (page: MessagesPage<SignerAddMessage>) => {
@@ -521,11 +606,12 @@ export default class Server {
         );
       },
       getFids: async (call, callback) => {
-        const { pageSize, pageToken } = call.request;
+        const { pageSize, pageToken, reverse } = call.request;
 
         const result = await this.engine?.getFids({
           pageSize,
           pageToken,
+          reverse,
         });
         result?.match(
           (page: { fids: number[]; nextPageToken: Uint8Array | undefined }) => {
@@ -537,10 +623,11 @@ export default class Server {
         );
       },
       getAllCastMessagesByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllCastMessagesByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         result?.match(
           (page: MessagesPage<CastAddMessage | CastRemoveMessage>) => {
@@ -552,10 +639,11 @@ export default class Server {
         );
       },
       getAllReactionMessagesByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllReactionMessagesByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         result?.match(
           (page: MessagesPage<ReactionAddMessage | ReactionRemoveMessage>) => {
@@ -567,10 +655,11 @@ export default class Server {
         );
       },
       getAllVerificationMessagesByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllVerificationMessagesByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         result?.match(
           (page: MessagesPage<VerificationAddEthAddressMessage | VerificationRemoveMessage>) => {
@@ -582,10 +671,11 @@ export default class Server {
         );
       },
       getAllSignerMessagesByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllSignerMessagesByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         result?.match(
           (page: MessagesPage<SignerAddMessage | SignerRemoveMessage>) => {
@@ -597,10 +687,11 @@ export default class Server {
         );
       },
       getAllUserDataMessagesByFid: async (call, callback) => {
-        const { fid, pageSize, pageToken } = call.request;
+        const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getUserDataByFid(fid, {
           pageSize,
           pageToken,
+          reverse,
         });
         result?.match(
           (page: MessagesPage<UserDataAddMessage>) => {
@@ -622,7 +713,7 @@ export default class Server {
         const { request } = stream;
 
         if (this.engine && request.fromId) {
-          const eventsIterator = this.engine.eventHandler.getEventsIterator(request.fromId);
+          const eventsIterator = this.engine.eventHandler.getEventsIterator({ fromId: request.fromId });
           if (eventsIterator.isErr()) {
             stream.destroy(eventsIterator.error);
             return;

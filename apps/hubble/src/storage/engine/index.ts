@@ -8,9 +8,11 @@ import {
   utf8StringToBytes,
   validations,
 } from '@farcaster/utils';
+import fs from 'fs';
 import { err, ok, Result, ResultAsync } from 'neverthrow';
+import { Worker } from 'worker_threads';
 import { SyncId } from '~/network/sync/syncId';
-import { getManyMessages, typeToSetPostfix } from '~/storage/db/message';
+import { getManyMessages, getMessage, getMessagesBySignerIterator, typeToSetPostfix } from '~/storage/db/message';
 import RocksDB from '~/storage/db/rocksdb';
 import { FID_BYTES, RootPrefix, TSHASH_LENGTH, UserPostfix } from '~/storage/db/types';
 import CastStore from '~/storage/stores/castStore';
@@ -21,6 +23,12 @@ import { MessagesPage, PageOptions } from '~/storage/stores/types';
 import UserDataStore from '~/storage/stores/userDataStore';
 import VerificationStore from '~/storage/stores/verificationStore';
 import { logger } from '~/utils/logger';
+import { StorageCache } from '~/storage/engine/storageCache';
+import {
+  RevokeMessagesBySignerJobQueue,
+  RevokeMessagesBySignerJobWorker,
+} from '~/storage/jobs/revokeMessagesBySignerJob';
+import { getIdRegistryEventByCustodyAddress } from '../db/idRegistryEvent';
 
 const log = logger.child({
   component: 'Engine',
@@ -38,17 +46,98 @@ class Engine {
   private _userDataStore: UserDataStore;
   private _verificationStore: VerificationStore;
 
+  private _validationWorker: Worker | undefined;
+  private _validationWorkerJobId = 0;
+  private _validationWorkerPromiseMap = new Map<number, (resolve: HubResult<protobufs.Message>) => void>();
+
+  private _storageCache: StorageCache;
+  private _revokeSignerQueue: RevokeMessagesBySignerJobQueue;
+  private _revokeSignerWorker: RevokeMessagesBySignerJobWorker;
+
   constructor(db: RocksDB, network: protobufs.FarcasterNetwork) {
     this._db = db;
     this._network = network;
 
-    this.eventHandler = new StoreEventHandler(db);
+    this._storageCache = new StorageCache();
+    this.eventHandler = new StoreEventHandler(db, this._storageCache);
 
     this._reactionStore = new ReactionStore(db, this.eventHandler);
     this._signerStore = new SignerStore(db, this.eventHandler);
     this._castStore = new CastStore(db, this.eventHandler);
     this._userDataStore = new UserDataStore(db, this.eventHandler);
     this._verificationStore = new VerificationStore(db, this.eventHandler);
+
+    this._revokeSignerQueue = new RevokeMessagesBySignerJobQueue(db);
+    this._revokeSignerWorker = new RevokeMessagesBySignerJobWorker(this._revokeSignerQueue, db, this);
+
+    this.handleMergeMessageEvent = this.handleMergeMessageEvent.bind(this);
+    this.handleMergeIdRegistryEvent = this.handleMergeIdRegistryEvent.bind(this);
+    this.handleMergeNameRegistryEvent = this.handleMergeNameRegistryEvent.bind(this);
+    this.handleRevokeMessageEvent = this.handleRevokeMessageEvent.bind(this);
+    this.handlePruneMessageEvent = this.handlePruneMessageEvent.bind(this);
+  }
+
+  async start(): Promise<void> {
+    log.info('starting engine');
+
+    this._revokeSignerWorker.start();
+
+    if (!this._validationWorker) {
+      const workerPath = './build/storage/engine/validation.worker.js';
+      try {
+        if (fs.existsSync(workerPath)) {
+          this._validationWorker = new Worker(workerPath);
+
+          logger.info({ workerPath }, 'created validation worker thread');
+
+          this._validationWorker.on('message', (data) => {
+            const { id, message, errCode, errMessage } = data;
+            const resolve = this._validationWorkerPromiseMap.get(id);
+
+            if (resolve) {
+              this._validationWorkerPromiseMap.delete(id);
+              if (message) {
+                resolve(ok(message));
+              } else {
+                resolve(err(new HubError(errCode, errMessage)));
+              }
+            } else {
+              logger.warn({ id }, 'validation worker promise.response not found');
+            }
+          });
+        } else {
+          logger.warn({ workerPath }, 'validation.worker.js not found, falling back to main thread');
+        }
+      } catch (e) {
+        logger.warn({ workerPath, e }, 'failed to create validation worker, falling back to main thread');
+      }
+    }
+
+    this.eventHandler.on('mergeIdRegistryEvent', this.handleMergeIdRegistryEvent);
+    this.eventHandler.on('mergeNameRegistryEvent', this.handleMergeNameRegistryEvent);
+    this.eventHandler.on('mergeMessage', this.handleMergeMessageEvent);
+    this.eventHandler.on('revokeMessage', this.handleRevokeMessageEvent);
+    this.eventHandler.on('pruneMessage', this.handlePruneMessageEvent);
+
+    await this._storageCache.syncFromDb(this._db);
+    log.info('engine started');
+  }
+
+  async stop(): Promise<void> {
+    log.info('stopping engine');
+    this.eventHandler.off('mergeIdRegistryEvent', this.handleMergeIdRegistryEvent);
+    this.eventHandler.off('mergeNameRegistryEvent', this.handleMergeNameRegistryEvent);
+    this.eventHandler.off('mergeMessage', this.handleMergeMessageEvent);
+    this.eventHandler.off('revokeMessage', this.handleRevokeMessageEvent);
+    this.eventHandler.off('pruneMessage', this.handlePruneMessageEvent);
+
+    this._revokeSignerWorker.start();
+
+    if (this._validationWorker) {
+      await this._validationWorker.terminate();
+      this._validationWorker = undefined;
+    }
+    log.info('engine stopped');
   }
 
   async mergeMessages(messages: protobufs.Message[]): Promise<Array<HubResult<number>>> {
@@ -80,19 +169,17 @@ class Engine {
   }
 
   async mergeIdRegistryEvent(event: protobufs.IdRegistryEvent): HubAsyncResult<number> {
-    // TODO: validate event
     if (
       event.type === protobufs.IdRegistryEventType.REGISTER ||
       event.type === protobufs.IdRegistryEventType.TRANSFER
     ) {
       return ResultAsync.fromPromise(this._signerStore.mergeIdRegistryEvent(event), (e) => e as HubError);
-    } else {
-      return err(new HubError('bad_request.validation_failure', 'invalid event type'));
     }
+
+    return err(new HubError('bad_request.validation_failure', 'invalid event type'));
   }
 
   async mergeNameRegistryEvent(event: protobufs.NameRegistryEvent): HubAsyncResult<number> {
-    // TODO: validate event
     if (
       event.type === protobufs.NameRegistryEventType.TRANSFER ||
       event.type === protobufs.NameRegistryEventType.RENEW
@@ -104,11 +191,66 @@ class Engine {
   }
 
   async revokeMessagesBySigner(fid: number, signer: Uint8Array): HubAsyncResult<void> {
-    await this._castStore.revokeMessagesBySigner(fid, signer);
-    await this._reactionStore.revokeMessagesBySigner(fid, signer);
-    await this._verificationStore.revokeMessagesBySigner(fid, signer);
-    await this._userDataStore.revokeMessagesBySigner(fid, signer);
-    await this._signerStore.revokeMessagesBySigner(fid, signer);
+    const signerHex = bytesToHexString(signer);
+    if (signerHex.isErr()) {
+      return err(signerHex.error);
+    }
+
+    let revokedCount = 0;
+
+    const iterator = getMessagesBySignerIterator(this._db, fid, signer);
+
+    const revokeMessageByKey = async (key: Buffer): HubAsyncResult<number | undefined> => {
+      const length = key.length;
+      const type = key.readUint8(length - TSHASH_LENGTH - 1);
+      const setPostfix = typeToSetPostfix(type);
+      const tsHash = Uint8Array.from(key.subarray(length - TSHASH_LENGTH));
+      const message = await ResultAsync.fromPromise(
+        getMessage(this._db, fid, setPostfix, tsHash),
+        (e) => e as HubError
+      );
+      if (message.isErr()) {
+        return err(message.error);
+      }
+
+      switch (setPostfix) {
+        case UserPostfix.ReactionMessage: {
+          return this._reactionStore.revoke(message.value);
+        }
+        case UserPostfix.SignerMessage: {
+          return this._signerStore.revoke(message.value);
+        }
+        case UserPostfix.CastMessage: {
+          return this._castStore.revoke(message.value);
+        }
+        case UserPostfix.UserDataMessage: {
+          return this._userDataStore.revoke(message.value);
+        }
+        case UserPostfix.VerificationMessage: {
+          return this._verificationStore.revoke(message.value);
+        }
+        default: {
+          return err(new HubError('bad_request.invalid_param', 'invalid message type'));
+        }
+      }
+    };
+
+    for await (const [key] of iterator) {
+      const revokeResult = await revokeMessageByKey(key as Buffer);
+      revokeResult.match(
+        () => {
+          revokedCount += 1;
+        },
+        (e) => {
+          log.error(
+            { errCode: e.errCode },
+            `error revoking message from signer ${signerHex.value} and fid ${fid}: ${e.message}`
+          );
+        }
+      );
+    }
+
+    log.info(`revoked ${revokedCount} messages from ${signerHex.value} and fid ${fid}`);
 
     return ok(undefined);
   }
@@ -118,14 +260,17 @@ class Engine {
       result.match(
         (ids) => {
           if (ids.length > 0) {
-            log.info(`Pruned ${ids.length} ${store} messages for fid ${fid}`);
+            log.info(`pruned ${ids.length} ${store} messages for fid ${fid}`);
           }
         },
         (e) => {
-          log.error(`Error pruning ${store} messages for fid ${fid}`, e);
+          log.error({ errCode: e.errCode }, `error pruning ${store} messages for fid ${fid}: ${e.message}`);
         }
       );
     };
+
+    const signerResult = await this._signerStore.pruneMessages(fid);
+    logPruneResult(signerResult, 'signer');
 
     const castResult = await this._castStore.pruneMessages(fid);
     logPruneResult(castResult, 'cast');
@@ -138,9 +283,6 @@ class Engine {
 
     const userDataResult = await this._userDataStore.pruneMessages(fid);
     logPruneResult(userDataResult, 'user data');
-
-    const signerResult = await this._signerStore.pruneMessages(fid);
-    logPruneResult(signerResult, 'signer');
 
     return ok(undefined);
   }
@@ -160,7 +302,11 @@ class Engine {
   async forEachMessage(callback: (message: protobufs.Message, key: Buffer) => Promise<boolean | void>): Promise<void> {
     const allUserPrefix = Buffer.from([RootPrefix.User]);
 
-    for await (const [key, value] of this._db.iteratorByPrefix(allUserPrefix, { keys: true, valueAsBuffer: true })) {
+    for await (const [key, value] of this._db.iteratorByPrefix(allUserPrefix, { keys: true })) {
+      if (!key || !value) {
+        break;
+      }
+
       if (key.length !== 1 + FID_BYTES + 1 + TSHASH_LENGTH) {
         // Not a message key, so we can skip it.
         continue;
@@ -193,6 +339,7 @@ class Engine {
       }
     }
   }
+
   async getAllMessagesBySyncIds(syncIds: Uint8Array[]): HubAsyncResult<protobufs.Message[]> {
     const hashesBuf = syncIds.map((syncIdHash) => SyncId.pkFromSyncId(syncIdHash));
     const messages = await ResultAsync.fromPromise(getManyMessages(this._db, hashesBuf), (e) => e as HubError);
@@ -553,7 +700,139 @@ class Engine {
     }
 
     // 6. Check message body and envelope
-    return validations.validateMessage(message);
+    if (this._validationWorker) {
+      return new Promise<HubResult<protobufs.Message>>((resolve) => {
+        const id = this._validationWorkerJobId++;
+        this._validationWorkerPromiseMap.set(id, resolve);
+
+        this._validationWorker?.postMessage({ id, message });
+      });
+    } else {
+      return validations.validateMessage(message);
+    }
+  }
+
+  private async handleMergeIdRegistryEvent(event: protobufs.MergeIdRegistryEventHubEvent): HubAsyncResult<void> {
+    const { idRegistryEvent } = event.mergeIdRegistryEventBody;
+    const fromAddress = idRegistryEvent.from;
+    if (fromAddress && fromAddress.length > 0) {
+      const payload = protobufs.RevokeMessagesBySignerJobPayload.create({
+        fid: idRegistryEvent.fid,
+        signer: fromAddress,
+      });
+      const enqueueRevoke = await this._revokeSignerQueue.enqueueJob(payload);
+      if (enqueueRevoke.isErr()) {
+        log.error(
+          { errCode: enqueueRevoke.error.errCode },
+          `failed to enqueue revoke signer job: ${enqueueRevoke.error.message}`
+        );
+      }
+    }
+
+    return ok(undefined);
+  }
+
+  private async handleMergeNameRegistryEvent(event: protobufs.MergeNameRegistryEventHubEvent): HubAsyncResult<void> {
+    const { nameRegistryEvent } = event.mergeNameRegistryEventBody;
+
+    // When there is a NameRegistryEvent, we need to check if we need to revoke UserDataAdd messages from the
+    // previous owner of the name.
+    if (nameRegistryEvent.type === protobufs.NameRegistryEventType.TRANSFER && nameRegistryEvent.from.length > 0) {
+      // Check to see if the from address has an fid
+      const idRegistryEvent = await ResultAsync.fromPromise(
+        getIdRegistryEventByCustodyAddress(this._db, nameRegistryEvent.from),
+        () => undefined
+      );
+
+      if (idRegistryEvent.isOk()) {
+        const { fid } = idRegistryEvent.value;
+
+        // Check if this fid assigned the fname with a UserDataAdd message
+        const fnameAdd = await ResultAsync.fromPromise(
+          this._userDataStore.getUserDataAdd(fid, protobufs.UserDataType.FNAME),
+          () => undefined
+        );
+        if (fnameAdd.isOk()) {
+          const revokeResult = await this._userDataStore.revoke(fnameAdd.value);
+          const fnameAddHex = bytesToHexString(fnameAdd.value.hash);
+          revokeResult.match(
+            () =>
+              log.info(
+                `revoked message ${fnameAddHex._unsafeUnwrap()} for fid ${fid} due to NameRegistryEvent transfer`
+              ),
+            (e) =>
+              log.error(
+                { errCode: e.errCode },
+                `failed to revoke message ${fnameAddHex._unsafeUnwrap()} for fid ${fid} due to NameRegistryEvent transfer: ${
+                  e.message
+                }`
+              )
+          );
+        }
+      }
+    }
+
+    return ok(undefined);
+  }
+
+  private async handleMergeMessageEvent(event: protobufs.MergeMessageHubEvent): HubAsyncResult<void> {
+    const { message } = event.mergeMessageBody;
+
+    if (protobufs.isSignerRemoveMessage(message)) {
+      const payload = protobufs.RevokeMessagesBySignerJobPayload.create({
+        fid: message.data.fid,
+        signer: message.data.signerRemoveBody.signer,
+      });
+      const enqueueRevoke = await this._revokeSignerQueue.enqueueJob(payload);
+      if (enqueueRevoke.isErr()) {
+        log.error(
+          { errCode: enqueueRevoke.error.errCode },
+          `failed to enqueue revoke signer job: ${enqueueRevoke.error.message}`
+        );
+      }
+    }
+
+    return ok(undefined);
+  }
+
+  private async handlePruneMessageEvent(event: protobufs.PruneMessageHubEvent): HubAsyncResult<void> {
+    const { message } = event.pruneMessageBody;
+
+    if (protobufs.isSignerAddMessage(message)) {
+      const payload = protobufs.RevokeMessagesBySignerJobPayload.create({
+        fid: message.data.fid,
+        signer: message.data.signerAddBody.signer,
+      });
+      const enqueueRevoke = await this._revokeSignerQueue.enqueueJob(payload);
+      if (enqueueRevoke.isErr()) {
+        log.error(
+          { errCode: enqueueRevoke.error.errCode },
+          `failed to enqueue revoke signer job: ${enqueueRevoke.error.message}`
+        );
+      }
+    }
+
+    return ok(undefined);
+  }
+
+  private async handleRevokeMessageEvent(event: protobufs.RevokeMessageHubEvent): HubAsyncResult<void> {
+    const { message } = event.revokeMessageBody;
+
+    if (protobufs.isSignerAddMessage(message)) {
+      const payload = protobufs.RevokeMessagesBySignerJobPayload.create({
+        fid: message.data.fid,
+        signer: message.data.signerAddBody.signer,
+      });
+      const enqueueRevoke = await this._revokeSignerQueue.enqueueJob(payload);
+      if (enqueueRevoke.isErr()) {
+        log.error(
+          { errCode: enqueueRevoke.error.errCode },
+          `failed to enqueue revoke signer job: ${enqueueRevoke.error.message}`
+        );
+      }
+    }
+
+    return ok(undefined);
   }
 }
 

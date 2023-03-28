@@ -1,5 +1,45 @@
 # @farcaster/utils
 
+## 0.4.0
+
+### Minor Changes
+
+- e5cb327: Remove getHubRpcClient, use getSSLRpcClient() or getInsecureRpcClient()
+
+### Patch Changes
+
+- Updated dependencies [e5cb327]
+  - @farcaster/protobufs@0.1.11
+
+## 0.3.1
+
+### Patch Changes
+
+- 12c9c40: chore: use minimally specified ethers signer type
+- dc69b66: feat: add EthersV5Eip712Signer
+- 5c78405: upgrade ethers to 6.2.1
+- Updated dependencies [6a0bf29]
+- Updated dependencies [23de6e7]
+  - @farcaster/protobufs@0.1.10
+
+## 0.3.0
+
+### Minor Changes
+
+- 59920f9: upgrade ethers from v5 to v6
+- 99518ef: refactor: generic and library specific signer classes
+
+  - `Eip712Signer` has been renamed to `EthersEip712Signer` and should be built with `new EthersEip712Signer(wallet)` instead of `Eip712Signer.fromSigner`
+  - `Ed25519Signer` has been renamed to `NobleEd25519Signer` and should be built with `new NobleEd25519Signer(privateKey)` instead of `Ed25519Signer.fromPrivateKey`
+
+### Patch Changes
+
+- 1b0e3a7: Add RPC Auth via Env variables and a new getAuthMetadata method to make it easier to use RPC auth
+- 1e4482e: updated dependencies
+- Updated dependencies [469825e]
+- Updated dependencies [1e4482e]
+  - @farcaster/protobufs@0.1.9
+
 ## 0.2.12
 
 ### Patch Changes

@@ -1,5 +1,25 @@
 # @farcaster/protobufs
 
+## 0.1.11
+
+### Patch Changes
+
+- e5cb327: Remove getHubRpcClient, use getSSLRpcClient() or getInsecureRpcClient()
+
+## 0.1.10
+
+### Patch Changes
+
+- 6a0bf29: Gossip dnsName when sharing contact info
+- 23de6e7: update RevokeMessagesBySignerJob payload
+
+## 0.1.9
+
+### Patch Changes
+
+- 469825e: feat: add reverse param to list grpc methods
+- 1e4482e: updated dependencies
+
 ## 0.1.8
 
 ### Patch Changes

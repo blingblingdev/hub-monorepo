@@ -5,10 +5,12 @@ import StoreEventHandler from '~/storage/stores/storeEventHandler';
 import UserDataStore from '~/storage/stores/userDataStore';
 import { getMessage, makeTsHash } from '../db/message';
 import { UserPostfix } from '../db/types';
+import { StorageCache } from '~/storage/engine/storageCache';
+import { err } from 'neverthrow';
 
 const db = jestRocksDB('protobufs.userDataSet.test');
-
-const eventHandler = new StoreEventHandler(db);
+const cache = new StorageCache();
+const eventHandler = new StoreEventHandler(db, cache);
 const set = new UserDataStore(db, eventHandler);
 const fid = Factories.Fid.build();
 
@@ -199,6 +201,50 @@ describe('merge', () => {
   });
 });
 
+describe('revoke', () => {
+  let revokedMessages: protobufs.Message[] = [];
+
+  const revokeMessageHandler = (event: protobufs.RevokeMessageHubEvent) => {
+    revokedMessages.push(event.revokeMessageBody.message);
+  };
+
+  beforeAll(() => {
+    eventHandler.on('revokeMessage', revokeMessageHandler);
+  });
+
+  beforeEach(() => {
+    revokedMessages = [];
+  });
+
+  afterAll(() => {
+    eventHandler.off('revokeMessage', revokeMessageHandler);
+  });
+
+  test('fails with invalid message type', async () => {
+    const castAdd = await Factories.CastAddMessage.create({ data: { fid } });
+    const result = await set.revoke(castAdd);
+    expect(result).toEqual(err(new HubError('bad_request.invalid_param', 'invalid message type')));
+    expect(revokedMessages).toEqual([]);
+  });
+
+  test('succeeds with UserDataAdd', async () => {
+    await expect(set.merge(addBio)).resolves.toBeGreaterThan(0);
+    const result = await set.revoke(addBio);
+    expect(result.isOk()).toBeTruthy();
+    expect(result._unsafeUnwrap()).toBeGreaterThan(0);
+    await expect(set.getUserDataAdd(fid, protobufs.UserDataType.BIO)).rejects.toThrow();
+    expect(revokedMessages).toEqual([addBio]);
+  });
+
+  test('succeeds with unmerged message', async () => {
+    const result = await set.revoke(addPfp);
+    expect(result.isOk()).toBeTruthy();
+    expect(result._unsafeUnwrap()).toBeGreaterThan(0);
+    await expect(set.getUserDataAdd(fid, protobufs.UserDataType.PFP)).rejects.toThrow();
+    expect(revokedMessages).toEqual([addPfp]);
+  });
+});
+
 describe('pruneMessages', () => {
   let prunedMessages: protobufs.Message[];
   const pruneMessageListener = (event: protobufs.PruneMessageHubEvent) => {
@@ -236,6 +282,10 @@ describe('pruneMessages', () => {
     add2 = await generateAddWithTimestamp(fid, time + 2, protobufs.UserDataType.DISPLAY);
     add3 = await generateAddWithTimestamp(fid, time + 3, protobufs.UserDataType.BIO);
     add4 = await generateAddWithTimestamp(fid, time + 5, protobufs.UserDataType.URL);
+  });
+
+  beforeEach(async () => {
+    await cache.syncFromDb(db);
   });
 
   describe('with size limit', () => {

@@ -1,8 +1,7 @@
 import * as protobufs from '@farcaster/protobufs';
 import { bytesIncrement, HubError, HubResult } from '@farcaster/utils';
 import { err, ok, ResultAsync } from 'neverthrow';
-import AbstractRocksDB from 'rocksdb';
-import RocksDB, { Transaction } from '~/storage/db/rocksdb';
+import RocksDB, { Iterator, Transaction } from '~/storage/db/rocksdb';
 import {
   FID_BYTES,
   RootPrefix,
@@ -157,9 +156,38 @@ export const getAllMessagesByFid = async (db: RocksDB, fid: number): Promise<pro
   };
   const messages = [];
   for await (const [, buffer] of db.iterator(iteratorOptions)) {
-    messages.push(protobufs.Message.decode(new Uint8Array(buffer)));
+    messages.push(protobufs.Message.decode(new Uint8Array(buffer as Buffer)));
   }
   return messages;
+};
+
+export const getPageIteratorByPrefix = (db: RocksDB, prefix: Buffer, pageOptions: PageOptions = {}): Iterator => {
+  const prefixEnd = bytesIncrement(Uint8Array.from(prefix));
+  if (prefixEnd.isErr()) {
+    throw prefixEnd.error;
+  }
+
+  let startKey: Buffer;
+  if (pageOptions.pageToken) {
+    startKey = Buffer.concat([prefix, Buffer.from(pageOptions.pageToken)]);
+  } else if (pageOptions.reverse === true) {
+    startKey = Buffer.from(prefixEnd.value);
+  } else {
+    startKey = prefix;
+  }
+
+  if (pageOptions.pageSize && pageOptions.pageSize > PAGE_SIZE_MAX) {
+    throw new HubError('bad_request.invalid_param', `pageSize > ${PAGE_SIZE_MAX}`);
+  }
+
+  return db.iterator(
+    pageOptions.reverse === true
+      ? { lt: startKey, gt: prefix, reverse: true }
+      : {
+          gt: startKey,
+          lt: Buffer.from(prefixEnd.value),
+        }
+  );
 };
 
 export const getMessagesPageByPrefix = async <T extends protobufs.Message>(
@@ -168,36 +196,15 @@ export const getMessagesPageByPrefix = async <T extends protobufs.Message>(
   filter: (message: protobufs.Message) => message is T,
   pageOptions: PageOptions = {}
 ): Promise<MessagesPage<T>> => {
-  const startKey = Buffer.concat([prefix, Buffer.from(pageOptions.pageToken ?? '')]);
+  const iterator = getPageIteratorByPrefix(db, prefix, pageOptions);
 
-  if (pageOptions.pageSize && pageOptions.pageSize > PAGE_SIZE_MAX) {
-    throw new HubError('bad_request.invalid_param', `pageSize > ${PAGE_SIZE_MAX}`);
-  }
   const limit = pageOptions.pageSize || PAGE_SIZE_MAX;
 
-  const endKey = bytesIncrement(Uint8Array.from(prefix));
-  if (endKey.isErr()) {
-    throw endKey.error;
-  }
-
   const messages: T[] = [];
-  const iterator = db.iterator({
-    gt: startKey,
-    lt: Buffer.from(endKey.value),
-    keyAsBuffer: true,
-    valueAsBuffer: true,
-  });
 
-  const getNextIteratorRecord = (iterator: AbstractRocksDB.Iterator): Promise<[Buffer, protobufs.Message]> => {
-    return new Promise((resolve, reject) => {
-      iterator.next((err: Error | undefined, key: AbstractRocksDB.Bytes, value: AbstractRocksDB.Bytes) => {
-        if (err || !value) {
-          reject(err);
-        } else {
-          resolve([key as Buffer, protobufs.Message.decode(new Uint8Array(value as Buffer))]);
-        }
-      });
-    });
+  const getNextIteratorRecord = async (iterator: Iterator): Promise<[Buffer, protobufs.Message]> => {
+    const [key, value] = await iterator.next();
+    return [key as Buffer, protobufs.Message.decode(new Uint8Array(value as Buffer))];
   };
 
   let iteratorFinished = false;
@@ -217,10 +224,21 @@ export const getMessagesPageByPrefix = async <T extends protobufs.Message>(
   } while (messages.length < limit);
 
   if (!iteratorFinished) {
+    await iterator.end(); // clear iterator if it has not finished
     return { messages, nextPageToken: lastPageToken };
   } else {
     return { messages, nextPageToken: undefined };
   }
+};
+
+export const getMessagesBySignerIterator = (
+  db: RocksDB,
+  fid: number,
+  signer: Uint8Array,
+  type?: protobufs.MessageType
+): Iterator => {
+  const prefix = makeMessageBySignerKey(fid, signer, type);
+  return db.iteratorByPrefix(prefix, { values: false });
 };
 
 /** Get an array of messages for a given fid and signer */
@@ -242,7 +260,7 @@ export const getAllMessagesBySigner = async <T extends protobufs.Message>(
     // Get the tsHash for the message using its position in the key relative to the prefix
     // If the prefix did not include type, add an extra byte to the tsHash offset
     const tsHashOffset = prefix.length + (type ? 0 : 1);
-    const tsHash = new Uint8Array(key.slice(tsHashOffset));
+    const tsHash = new Uint8Array((key as Buffer).slice(tsHashOffset));
 
     // Get the type for the message, either from the predefined type variable or by looking at the byte
     // prior to the tsHash in the key
@@ -260,25 +278,14 @@ export const getAllMessagesBySigner = async <T extends protobufs.Message>(
   return getManyMessages(db, primaryKeys);
 };
 
-export const getMessagesPruneIterator = (
-  db: RocksDB,
-  fid: number,
-  setPostfix: UserMessagePostfix
-): AbstractRocksDB.Iterator => {
+export const getMessagesPruneIterator = (db: RocksDB, fid: number, setPostfix: UserMessagePostfix): Iterator => {
   const prefix = makeMessagePrimaryKey(fid, setPostfix);
   return db.iteratorByPrefix(prefix, { keys: false, valueAsBuffer: true });
 };
 
-export const getNextMessageToPrune = (iterator: AbstractRocksDB.Iterator): Promise<protobufs.Message> => {
-  return new Promise((resolve, reject) => {
-    iterator.next((err: Error | undefined, _: AbstractRocksDB.Bytes, value: AbstractRocksDB.Bytes) => {
-      if (err || !value) {
-        reject(err);
-      } else {
-        resolve(protobufs.Message.decode(new Uint8Array(value as Buffer)));
-      }
-    });
-  });
+export const getNextMessageFromIterator = async (iterator: Iterator): Promise<protobufs.Message> => {
+  const [, value] = await iterator.next();
+  return protobufs.Message.decode(new Uint8Array(value as Buffer));
 };
 
 export const putMessageTransaction = (txn: Transaction, message: protobufs.Message): Transaction => {

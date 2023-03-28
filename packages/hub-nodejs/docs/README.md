@@ -1,6 +1,6 @@
 # Documentation
 
-@farcaster/hub-nodejs has four major components:
+@farcaster/hub-nodejs has five major components:
 
 - A [Client](./Client.md), which can send and receive messages from a Farcaster Hub.
 - [Messages](./Messages.md), which are the atomic units of change on the Farcaster network.
@@ -10,19 +10,18 @@
 
 ## Idiosyncrasies
 
-There are four important things to know about the package:
-
-- Fixed length data is encoded in [byte formats](./Utils.md#bytes), instead of strings.
-- Errors are handled with [a monadic pattern](./Utils.md#errors), instead of try-catch.
-- Timestamps are calculated from the [Farcaster epoch](./Utils.md#time), not the Unix epoch.
-- Only Nodejs is supported, and browser support is a [work in progress](https://github.com/farcasterxyz/hubble/issues/573).
+1. Timestamps are calculated from the [Farcaster epoch](./Utils.md#time), not the Unix epoch.
+2. Errors are handled with [a monadic pattern](./Utils.md#errors), instead of try-catch.
+3. [Ethers](https://www.npmjs.com/package/ethers) and [noble](https://www.npmjs.com/package/@noble/ed25519) are required to create new messages.
+4. Only Nodejs is supported, and browser support is a [work in progress](https://github.com/farcasterxyz/hubble/issues/573).
+5. Fixed length data is encoded in [byte formats](./Utils.md#bytes), instead of strings.
 
 There are also a few Farcaster-specific terms that are very commonly used in this package:
 
 | Term     | Description                                                               |
 | -------- | ------------------------------------------------------------------------- |
 | Cast     | A public message posted by a user                                         |
-| Fid      | A farcaster id, issued by the Id Registry on Ethereum                     |
-| Fname    | A farcaster username, issued by the Name Registry on Ethereum.            |
+| Fid      | A Farcaster id, issued by the Id Registry on Ethereum                     |
+| Fname    | A Farcaster username, issued by the Name Registry on Ethereum.            |
 | Hub      | A node in the Farcaster network which stores Farcaster Messages           |
 | Reaction | A public action between a user and a piece of content (e.g. like, recast) |

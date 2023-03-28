@@ -1,3 +1,4 @@
+import { ResultAsync } from 'neverthrow';
 import cron from 'node-cron';
 import { Hub } from '~/hubble';
 import { logger } from '~/utils/logger';
@@ -15,6 +16,8 @@ export class PeriodicSyncJobScheduler {
   private _hub: Hub;
   private _syncEngine: SyncEngine;
   private _cronTask?: cron.ScheduledTask;
+
+  private _jobCount = 0;
 
   constructor(_hub: Hub, _syncEngine: SyncEngine) {
     this._hub = _hub;
@@ -38,9 +41,15 @@ export class PeriodicSyncJobScheduler {
   }
 
   async doJobs() {
-    log.info('starting doJobs');
+    this._jobCount += 1;
+    log.info({ jobCount: this._jobCount }, 'starting periodic sync job');
 
     // Do a diff sync
-    await this._syncEngine.diffSyncIfRequired(this._hub);
+    const syncResult = await ResultAsync.fromPromise(this._syncEngine.diffSyncIfRequired(this._hub), (e) => e);
+    if (syncResult.isErr()) {
+      log.error({ err: syncResult.error }, 'error during periodic sync job');
+    }
+
+    this._jobCount -= 1;
   }
 }

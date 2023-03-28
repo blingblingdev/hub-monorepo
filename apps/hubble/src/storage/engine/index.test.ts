@@ -1,10 +1,12 @@
 import * as protobufs from '@farcaster/protobufs';
-import { bytesToUtf8String, Eip712Signer, Factories, HubError } from '@farcaster/utils';
+import { bytesToUtf8String, Factories, HubError } from '@farcaster/utils';
 import { err, Ok, ok } from 'neverthrow';
 import { jestRocksDB } from '~/storage/db/jestUtils';
 import Engine from '~/storage/engine';
 import SignerStore from '~/storage/stores/signerStore';
-import { getMessage, makeTsHash, typeToSetPostfix } from '../db/message';
+import { sleep } from '~/utils/crypto';
+import { getMessage, makeTsHash, typeToSetPostfix } from '~/storage/db/message';
+import { StoreEvents } from '~/storage/stores/storeEventHandler';
 
 const db = jestRocksDB('protobufs.engine.test');
 const network = protobufs.FarcasterNetwork.TESTNET;
@@ -16,8 +18,10 @@ const signerStore = new SignerStore(db, engine.eventHandler);
 const fid = Factories.Fid.build();
 const fname = Factories.Fname.build();
 const signer = Factories.Ed25519Signer.build();
+const custodySigner = Factories.Eip712Signer.build();
 
-let custodySigner: Eip712Signer;
+let custodySignerKey: Uint8Array;
+let signerKey: Uint8Array;
 let custodyEvent: protobufs.IdRegistryEvent;
 let fnameTransfer: protobufs.NameRegistryEvent;
 let signerAdd: protobufs.SignerAddMessage;
@@ -28,17 +32,18 @@ let verificationAdd: protobufs.VerificationAddEthAddressMessage;
 let userDataAdd: protobufs.UserDataAddMessage;
 
 beforeAll(async () => {
-  custodySigner = await Factories.Eip712Signer.create();
-  custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySigner.signerKey });
+  signerKey = (await signer.getSignerKey())._unsafeUnwrap();
+  custodySignerKey = (await custodySigner.getSignerKey())._unsafeUnwrap();
+  custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySignerKey });
 
   fnameTransfer = Factories.NameRegistryEvent.build({ fname, to: custodyEvent.to });
 
   signerAdd = await Factories.SignerAddMessage.create(
-    { data: { fid, network, signerAddBody: { signer: signer.signerKey } } },
+    { data: { fid, network, signerAddBody: { signer: signerKey } } },
     { transient: { signer: custodySigner } }
   );
   signerRemove = await Factories.SignerRemoveMessage.create(
-    { data: { fid, network, timestamp: signerAdd.data.timestamp + 1, signerRemoveBody: { signer: signer.signerKey } } },
+    { data: { fid, network, timestamp: signerAdd.data.timestamp + 1, signerRemoveBody: { signer: signerKey } } },
     { transient: { signer: custodySigner } }
   );
 
@@ -82,15 +87,16 @@ describe('mergeNameRegistryEvent', () => {
 
 describe('mergeMessage', () => {
   let mergedMessages: protobufs.Message[];
+
   const handleMergeMessage = (event: protobufs.MergeMessageHubEvent) => {
     mergedMessages.push(event.mergeMessageBody.message);
   };
 
-  beforeAll(() => {
+  beforeAll(async () => {
     engine.eventHandler.on('mergeMessage', handleMergeMessage);
   });
 
-  afterAll(() => {
+  afterAll(async () => {
     engine.eventHandler.off('mergeMessage', handleMergeMessage);
   });
 
@@ -187,7 +193,7 @@ describe('mergeMessage', () => {
     describe('SignerRemove', () => {
       test('succeeds ', async () => {
         await expect(engine.mergeMessage(signerRemove)).resolves.toBeInstanceOf(Ok);
-        await expect(signerStore.getSignerRemove(fid, signer.signerKey)).resolves.toEqual(signerRemove);
+        await expect(signerStore.getSignerRemove(fid, signerKey)).resolves.toEqual(signerRemove);
         expect(mergedMessages).toEqual([signerAdd, signerRemove]);
       });
     });
@@ -302,6 +308,7 @@ describe('mergeMessage', () => {
         )
       )
     );
+    await mainnetEngine.stop();
   });
 });
 
@@ -371,7 +378,7 @@ describe('revokeMessagesBySigner', () => {
     for (const message of signerMessages) {
       await expect(checkMessage(message)).resolves.toEqual(message);
     }
-    await expect(engine.revokeMessagesBySigner(fid, custodySigner.signerKey)).resolves.toBeInstanceOf(Ok);
+    await expect(engine.revokeMessagesBySigner(fid, custodySignerKey)).resolves.toBeInstanceOf(Ok);
     for (const message of signerMessages) {
       await expect(checkMessage(message)).rejects.toThrow();
     }
@@ -383,10 +390,142 @@ describe('revokeMessagesBySigner', () => {
     for (const message of signerMessages) {
       await expect(checkMessage(message)).resolves.toEqual(message);
     }
-    await expect(engine.revokeMessagesBySigner(fid, signer.signerKey)).resolves.toBeInstanceOf(Ok);
+    await expect(engine.revokeMessagesBySigner(fid, signerKey)).resolves.toBeInstanceOf(Ok);
     for (const message of signerMessages) {
       await expect(checkMessage(message)).rejects.toThrow();
     }
     expect(revokedMessages).toEqual(signerMessages);
+  });
+});
+
+describe('with listeners and workers', () => {
+  const liveEngine = new Engine(db, protobufs.FarcasterNetwork.TESTNET);
+
+  let revokedMessages: protobufs.Message[];
+
+  const handleRevokeMessage = (event: protobufs.RevokeMessageHubEvent) => {
+    revokedMessages.push(event.revokeMessageBody.message);
+  };
+
+  beforeAll(async () => {
+    liveEngine.eventHandler.on('revokeMessage', handleRevokeMessage);
+  });
+
+  afterAll(async () => {
+    liveEngine.eventHandler.off('revokeMessage', handleRevokeMessage);
+  });
+
+  beforeEach(async () => {
+    revokedMessages = [];
+    await liveEngine.start();
+  });
+
+  afterEach(async () => {
+    await liveEngine.stop();
+  });
+
+  describe('with messages', () => {
+    beforeEach(async () => {
+      await liveEngine.mergeIdRegistryEvent(custodyEvent);
+      await liveEngine.mergeMessage(signerAdd);
+      await liveEngine.mergeMessages([castAdd, reactionAdd]);
+      expect(await liveEngine.getCast(fid, castAdd.hash)).toEqual(ok(castAdd));
+      expect(
+        await liveEngine.getReaction(
+          fid,
+          reactionAdd.data.reactionBody.type,
+          reactionAdd.data.reactionBody.targetCastId as protobufs.CastId
+        )
+      ).toEqual(ok(reactionAdd));
+    });
+
+    test('revokes messages when SignerRemove is merged', async () => {
+      await liveEngine.mergeMessage(signerRemove);
+      expect(revokedMessages).toEqual([]);
+      await sleep(200); // Wait for engine to revoke messages
+      expect(revokedMessages).toEqual([castAdd, reactionAdd]);
+    });
+
+    test('revokes messages when fid is transferred', async () => {
+      const custodyTransfer = Factories.IdRegistryEvent.build({
+        fid,
+        from: custodyEvent.to,
+        blockNumber: custodyEvent.blockNumber + 1,
+      });
+      await liveEngine.mergeIdRegistryEvent(custodyTransfer);
+      expect(revokedMessages).toEqual([]);
+      await sleep(200); // Wait for engine to revoke messages
+      expect(revokedMessages).toEqual([signerAdd, castAdd, reactionAdd]);
+    });
+
+    test('revokes messages when SignerAdd is pruned', async () => {
+      const event = protobufs.HubEvent.create({
+        type: protobufs.HubEventType.PRUNE_MESSAGE,
+        pruneMessageBody: { message: signerAdd },
+      });
+      liveEngine.eventHandler.emit('pruneMessage', event as protobufs.PruneMessageHubEvent); // Hack to force prune
+      expect(revokedMessages).toEqual([]);
+      await sleep(200); // Wait for engine to revoke messages
+      expect(revokedMessages).toEqual([castAdd, reactionAdd]);
+    });
+
+    test('revokes messages when SignerAdd is revoked', async () => {
+      const event = protobufs.HubEvent.create({
+        type: protobufs.HubEventType.REVOKE_MESSAGE,
+        revokeMessageBody: { message: signerAdd },
+      });
+      liveEngine.eventHandler.emit('revokeMessage', event as protobufs.RevokeMessageHubEvent); // Hack to force revoke
+      expect(revokedMessages).toEqual([signerAdd]);
+      await sleep(200); // Wait for engine to revoke messages
+      expect(revokedMessages).toEqual([signerAdd, castAdd, reactionAdd]);
+    });
+
+    test('revokes UserDataAdd when fname is transferred', async () => {
+      const fname = Factories.Fname.build();
+      const nameEvent = Factories.NameRegistryEvent.build({
+        fname,
+        to: custodyEvent.to,
+        type: protobufs.NameRegistryEventType.TRANSFER,
+      });
+      await expect(liveEngine.mergeNameRegistryEvent(nameEvent)).resolves.toBeInstanceOf(Ok);
+      const fnameAdd = await Factories.UserDataAddMessage.create(
+        {
+          data: {
+            userDataBody: { type: protobufs.UserDataType.FNAME, value: bytesToUtf8String(fname)._unsafeUnwrap() },
+            fid,
+          },
+        },
+        { transient: { signer } }
+      );
+      await expect(liveEngine.mergeMessage(fnameAdd)).resolves.toBeInstanceOf(Ok);
+      const nameTransfer = Factories.NameRegistryEvent.build({
+        fname,
+        from: custodySignerKey,
+        type: protobufs.NameRegistryEventType.TRANSFER,
+        blockNumber: nameEvent.blockNumber + 1,
+      });
+      await expect(liveEngine.mergeNameRegistryEvent(nameTransfer)).resolves.toBeInstanceOf(Ok);
+      expect(revokedMessages).toEqual([]);
+      await sleep(200); // Wait for engine to revoke messages
+      expect(revokedMessages).toEqual([fnameAdd]);
+    });
+  });
+});
+
+describe('stop', () => {
+  test('removes all event listeners', async () => {
+    const eventNames: (keyof StoreEvents)[] = ['mergeMessage', 'mergeIdRegistryEvent', 'pruneMessage', 'revokeMessage'];
+    const scopedEngine = new Engine(db, protobufs.FarcasterNetwork.TESTNET);
+    for (const eventName of eventNames) {
+      expect(scopedEngine.eventHandler.listenerCount(eventName)).toEqual(0);
+    }
+    await scopedEngine.start();
+    for (const eventName of eventNames) {
+      expect(scopedEngine.eventHandler.listenerCount(eventName)).toEqual(1);
+    }
+    await scopedEngine.stop();
+    for (const eventName of eventNames) {
+      expect(scopedEngine.eventHandler.listenerCount(eventName)).toEqual(0);
+    }
   });
 });

@@ -1,5 +1,5 @@
-import { Empty } from '@farcaster/protobufs';
-import { getAdminRpcClient, getHubRpcClient } from '@farcaster/utils';
+import { Empty, Metadata } from '@farcaster/protobufs';
+import { getAdminRpcClient, getAuthMetadata, getInsecureHubRpcClient, getSSLHubRpcClient } from '@farcaster/utils';
 import path from 'path';
 import * as repl from 'repl';
 import { ADMIN_SERVER_PORT } from '~/rpc/adminServer';
@@ -10,7 +10,7 @@ import { FactoriesCommand, ProtobufCommand } from './protobufCommand';
 import { RpcClientCommand } from './rpcClientCommand';
 import { WarpcastTestCommand } from './warpcastTestCommand';
 
-export const DEFAULT_RPC_CONSOLE = '127.0.0.1:13112';
+export const DEFAULT_RPC_CONSOLE = '127.0.0.1:2283';
 
 export interface ConsoleCommandInterface {
   commandName(): string;
@@ -19,10 +19,10 @@ export interface ConsoleCommandInterface {
   object(): any;
 }
 
-export const startConsole = async (addressString: string) => {
+export const startConsole = async (addressString: string, useInsecure: boolean) => {
   const replServer = repl
     .start({
-      prompt: 'hub> ',
+      prompt: `${addressString} hub> `,
       useColors: true,
       useGlobal: true,
       breakEvalOnSigint: true,
@@ -40,7 +40,13 @@ export const startConsole = async (addressString: string) => {
     }
   });
 
-  const rpcClient = await getHubRpcClient(addressString);
+  let rpcClient;
+  if (useInsecure) {
+    rpcClient = getInsecureHubRpcClient(addressString);
+  } else {
+    rpcClient = getSSLHubRpcClient(addressString);
+  }
+
   // Admin server is only available on localhost
   const adminClient = await getAdminRpcClient(`127.0.0.1:${ADMIN_SERVER_PORT}`);
 
@@ -71,10 +77,21 @@ export const startConsole = async (addressString: string) => {
     replServer.context[command.commandName()] = command.object();
   });
 
+  // Add some utility functions
+  replServer.context['getAuthMetadata'] = getAuthMetadata;
+
   // Run the info command to start
-  replServer.output.write(
-    'Connected Info: ' + JSON.stringify(await (commands[0] as RpcClientCommand).object().getInfo(Empty.create())) + '\n'
-  );
+
+  const info = await rpcClient.getInfo(Empty.create(), new Metadata(), { deadline: Date.now() + 2000 });
+
+  if (info.isErr()) {
+    replServer.output.write('Could not connect to hub at "' + addressString + '"\n');
+    // eslint-disable-next-line no-console
+    console.log(info.error);
+    process.exit(1);
+  }
+
+  replServer.output.write('Connected Info: ' + JSON.stringify(info.value) + '\n');
 
   replServer.displayPrompt();
 };

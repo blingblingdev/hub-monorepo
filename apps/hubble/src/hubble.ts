@@ -15,13 +15,13 @@ import {
   HubRpcClient,
   bytesToHexString,
   bytesToUtf8String,
-  getHubRpcClient,
+  getSSLHubRpcClient,
+  getInsecureHubRpcClient,
 } from '@farcaster/utils';
 import { PeerId } from '@libp2p/interface-peer-id';
 import { peerIdFromBytes } from '@libp2p/peer-id';
 import { publicAddressesFirst } from '@libp2p/utils/address-sort';
 import { Multiaddr, multiaddr } from '@multiformats/multiaddr';
-import { isIP } from 'net';
 import { Result, ResultAsync, err, ok } from 'neverthrow';
 import { EthEventsProvider, GoerliEthConstants } from '~/eth/ethEventsProvider';
 import { GossipNode, MAX_MESSAGE_QUEUE_SIZE } from '~/network/p2p/gossipNode';
@@ -34,12 +34,13 @@ import { getHubState, putHubState } from '~/storage/db/hubState';
 import RocksDB from '~/storage/db/rocksdb';
 import { RootPrefix } from '~/storage/db/types';
 import Engine from '~/storage/engine';
+import { PruneEventsJobScheduler } from '~/storage/jobs/pruneEventsJob';
 import { PruneMessagesJobScheduler } from '~/storage/jobs/pruneMessagesJob';
-import { RevokeSignerJobQueue, RevokeSignerJobScheduler } from '~/storage/jobs/revokeSignerJob';
 import {
   UpdateNameRegistryEventExpiryJobQueue,
   UpdateNameRegistryEventExpiryJobWorker,
 } from '~/storage/jobs/updateNameRegistryEventExpiryJob';
+import { sleep } from '~/utils/crypto';
 import { idRegistryEventToLog, logger, messageToLog, messageTypeToName, nameRegistryEventToLog } from '~/utils/logger';
 import {
   addressInfoFromGossip,
@@ -48,12 +49,12 @@ import {
   ipFamilyToString,
   p2pMultiAddrStr,
 } from '~/utils/p2p';
-import { sleep } from './utils/crypto';
+import { PeriodicTestDataJobScheduler, TestUser } from './utils/periodicTestDataJob';
 
 export type HubSubmitSource = 'gossip' | 'rpc' | 'eth-provider';
 
 export const APP_VERSION = process.env['npm_package_version'] ?? '1.0.0';
-export const APP_NICKNAME = 'Farcaster Hub';
+export const APP_NICKNAME = process.env['HUBBLE_NAME'] ?? 'Farcaster Hub';
 
 export interface HubInterface {
   engine: Engine;
@@ -83,6 +84,9 @@ export interface HubOptions {
   /** External IP address to announce to peers. If not provided, it'll fetch the IP from an external service */
   announceIp?: string;
 
+  /** External Server name to announce to peers. If provided, the RPC connection is made to this server name. Useful for SSL/TLS */
+  announceServerName?: string;
+
   /** Port for libp2p to listen for gossip */
   gossipPort?: number;
 
@@ -91,6 +95,9 @@ export interface HubOptions {
 
   /** Username and Password to use for RPC submit methods */
   rpcAuth?: string;
+
+  /** Enable IP Rate limiting */
+  rpcRateLimit?: number;
 
   /** Network URL of the IdRegistry Contract */
   ethRpcUrl?: string;
@@ -119,6 +126,12 @@ export interface HubOptions {
   /** Enables the Admin Server */
   adminServerEnabled?: boolean;
 
+  /** Host for the Admin Server to bind to */
+  adminServerHost?: string;
+
+  /** Periodically add casts & reactions for the following test users */
+  testUsers?: TestUser[];
+
   /**
    * Only allows the Hub to connect to and advertise local IP addresses
    *
@@ -126,11 +139,11 @@ export interface HubOptions {
    */
   localIpAddrsOnly?: boolean;
 
-  /** Cron schedule for revoke signer jobs */
-  revokeSignerJobCron?: string;
-
   /** Cron schedule for prune messages job */
   pruneMessagesJobCron?: string;
+
+  /** Cron schedule for prune events job */
+  pruneEventsJobCron?: string;
 }
 
 /** @returns A randomized string of the format `rocksdb.tmp.*` used for the DB Name */
@@ -151,50 +164,69 @@ export class Hub implements HubInterface {
   private rocksDB: RocksDB;
   private syncEngine: SyncEngine;
 
-  private revokeSignerJobQueue: RevokeSignerJobQueue;
-  private revokeSignerJobScheduler: RevokeSignerJobScheduler;
   private pruneMessagesJobScheduler: PruneMessagesJobScheduler;
   private periodSyncJobScheduler: PeriodicSyncJobScheduler;
+  private pruneEventsJobScheduler: PruneEventsJobScheduler;
+  private testDataJobScheduler?: PeriodicTestDataJobScheduler;
+
   private updateNameRegistryEventExpiryJobQueue: UpdateNameRegistryEventExpiryJobQueue;
-  private updateNameRegistryEventExpiryJobWorker: UpdateNameRegistryEventExpiryJobWorker;
+  private updateNameRegistryEventExpiryJobWorker?: UpdateNameRegistryEventExpiryJobWorker;
 
   engine: Engine;
-  ethRegistryProvider: EthEventsProvider;
+  ethRegistryProvider?: EthEventsProvider;
 
   constructor(options: HubOptions) {
     this.options = options;
     this.rocksDB = new RocksDB(options.rocksDBName ? options.rocksDBName : randomDbName());
     this.gossipNode = new GossipNode();
+
     this.engine = new Engine(this.rocksDB, options.network);
     this.syncEngine = new SyncEngine(this.engine, this.rocksDB);
 
-    this.rpcServer = new Server(this, this.engine, this.syncEngine, this.gossipNode, options.rpcAuth);
-    this.adminServer = new AdminServer(this, this.rocksDB, this.engine, this.syncEngine);
+    this.rpcServer = new Server(
+      this,
+      this.engine,
+      this.syncEngine,
+      this.gossipNode,
+      options.rpcAuth,
+      options.rpcRateLimit
+    );
+    this.adminServer = new AdminServer(this, this.rocksDB, this.engine, this.syncEngine, options.rpcAuth);
 
     // Create the ETH registry provider, which will fetch ETH events and push them into the engine.
     // Defaults to Goerli testnet, which is currently used for Production Farcaster Hubs.
-    this.ethRegistryProvider = EthEventsProvider.build(
-      this,
-      options.ethRpcUrl ?? '',
-      options.idRegistryAddress ?? GoerliEthConstants.IdRegistryAddress,
-      options.nameRegistryAddress ?? GoerliEthConstants.NameRegistryAddress,
-      options.firstBlock ?? GoerliEthConstants.FirstBlock,
-      options.chunkSize ?? GoerliEthConstants.ChunkSize
-    );
+    if (options.ethRpcUrl) {
+      this.ethRegistryProvider = EthEventsProvider.build(
+        this,
+        options.ethRpcUrl,
+        options.idRegistryAddress ?? GoerliEthConstants.IdRegistryAddress,
+        options.nameRegistryAddress ?? GoerliEthConstants.NameRegistryAddress,
+        options.firstBlock ?? GoerliEthConstants.FirstBlock,
+        options.chunkSize ?? GoerliEthConstants.ChunkSize
+      );
+    } else {
+      log.warn('No ETH RPC URL provided, not syncing with ETH contract events');
+    }
 
     // Setup job queues
-    this.revokeSignerJobQueue = new RevokeSignerJobQueue(this.rocksDB);
     this.updateNameRegistryEventExpiryJobQueue = new UpdateNameRegistryEventExpiryJobQueue(this.rocksDB);
 
     // Setup job schedulers/workers
-    this.revokeSignerJobScheduler = new RevokeSignerJobScheduler(this.revokeSignerJobQueue, this.engine);
     this.pruneMessagesJobScheduler = new PruneMessagesJobScheduler(this.engine);
     this.periodSyncJobScheduler = new PeriodicSyncJobScheduler(this, this.syncEngine);
-    this.updateNameRegistryEventExpiryJobWorker = new UpdateNameRegistryEventExpiryJobWorker(
-      this.updateNameRegistryEventExpiryJobQueue,
-      this.rocksDB,
-      this.ethRegistryProvider
-    );
+    this.pruneEventsJobScheduler = new PruneEventsJobScheduler(this.engine);
+
+    if (options.testUsers) {
+      this.testDataJobScheduler = new PeriodicTestDataJobScheduler(this.rpcServer, options.testUsers as TestUser[]);
+    }
+
+    if (this.ethRegistryProvider) {
+      this.updateNameRegistryEventExpiryJobWorker = new UpdateNameRegistryEventExpiryJobWorker(
+        this.updateNameRegistryEventExpiryJobQueue,
+        this.rocksDB,
+        this.ethRegistryProvider
+      );
+    }
   }
 
   get rpcAddress() {
@@ -238,11 +270,9 @@ export class Hub implements HubInterface {
           { retryCount, error: dbResult.error, errorMessage: dbResult.error.message },
           'failed to open rocksdb. Retry in 15s'
         );
-        await sleep(15 * 1000);
 
-        // It looks like we need to recreate the JS object to get a new lock on the same DB on disk
-        await ResultAsync.fromPromise(this.rocksDB.close(), (e) => e);
-        this.rocksDB = new RocksDB(this.options.rocksDBName ? this.options.rocksDBName : randomDbName());
+        // Sleep for 15s
+        await sleep(15 * 1000);
       } else {
         break;
       }
@@ -262,17 +292,25 @@ export class Hub implements HubInterface {
       // Read if the Hub was cleanly shutdown last time
       const cleanShutdownR = await this.wasHubCleanShutdown();
       if (cleanShutdownR.isOk() && !cleanShutdownR.value) {
-        // TODO: Should we forcibly rebuild the sync trie if the Hub was cleanly shutdown?
-        log.warn('Hub was NOT shutdown cleanly.');
-        log.warn('You should rebuild the sync trie (with --rebuild-sync-trie) to avoid inconsistencies');
+        log.warn(
+          'Hub was NOT shutdown cleanly. Sync might re-fetch messages. Please re-run with --rebuild-sync-trie to rebuild the trie if needed.'
+        );
       }
     }
 
+    await this.engine.start();
+
     // Start the ETH registry provider first
-    await this.ethRegistryProvider.start();
+    if (this.ethRegistryProvider) {
+      await this.ethRegistryProvider.start();
+    }
 
     // Start the sync engine
     await this.syncEngine.initialize(this.options.rebuildSyncTrie ?? false);
+
+    if (this.updateNameRegistryEventExpiryJobWorker) {
+      this.updateNameRegistryEventExpiryJobWorker.start();
+    }
 
     await this.gossipNode.start(this.options.bootstrapAddrs ?? [], {
       peerId: this.options.peerId,
@@ -285,14 +323,17 @@ export class Hub implements HubInterface {
     // Start the RPC server
     await this.rpcServer.start(this.options.rpcPort ? this.options.rpcPort : 0);
     if (this.options.adminServerEnabled) {
-      await this.adminServer.start();
+      await this.adminServer.start(this.options.adminServerHost ?? '127.0.0.1');
     }
     this.registerEventHandlers();
 
     // Start cron tasks
-    this.revokeSignerJobScheduler.start(this.options.revokeSignerJobCron);
     this.pruneMessagesJobScheduler.start(this.options.pruneMessagesJobCron);
     this.periodSyncJobScheduler.start();
+    this.pruneEventsJobScheduler.start(this.options.pruneEventsJobCron);
+
+    // Start the test data generator
+    this.testDataJobScheduler?.start();
 
     // When we startup, we write into the DB that we have not yet cleanly shutdown. And when we do
     // shutdown, we'll write "true" to this key, indicating that we've cleanly shutdown.
@@ -308,7 +349,12 @@ export class Hub implements HubInterface {
     const rpcPort = this.rpcServer.address?.map((addr) => addr.port).unwrapOr(0);
 
     const gossipAddressContactInfo = GossipAddressInfo.create({ address: announceIp, family, port: gossipPort });
-    const rpcAddressContactInfo = GossipAddressInfo.create({ address: announceIp, family, port: rpcPort });
+    const rpcAddressContactInfo = GossipAddressInfo.create({
+      address: announceIp,
+      family,
+      port: rpcPort,
+      dnsName: this.options.announceServerName ?? '',
+    });
 
     const snapshot = await this.syncEngine.getSnapshot();
     return snapshot.map((snapshot) => {
@@ -328,19 +374,26 @@ export class Hub implements HubInterface {
 
     // First, stop the RPC/Gossip server so we don't get any more messages
     await this.rpcServer.stop(true); // Force shutdown until we have a graceful way of ending active streams
-    await this.adminServer.stop();
-    await this.gossipNode.stop();
+
+    // Stop admin, gossip and sync engine
+    await Promise.all([this.adminServer.stop(), this.gossipNode.stop(), this.syncEngine.stop()]);
+
+    if (this.updateNameRegistryEventExpiryJobWorker) {
+      this.updateNameRegistryEventExpiryJobWorker.stop();
+    }
 
     // Stop cron tasks
-    this.revokeSignerJobScheduler.stop();
     this.pruneMessagesJobScheduler.stop();
     this.periodSyncJobScheduler.stop();
-
-    // Stop sync
-    await this.syncEngine.stop();
+    this.pruneEventsJobScheduler.stop();
 
     // Stop the ETH registry provider
-    await this.ethRegistryProvider.stop();
+    if (this.ethRegistryProvider) {
+      await this.ethRegistryProvider.stop();
+    }
+
+    // Stop the engine
+    await this.engine.stop();
 
     // Close the DB, which will flush all data to disk. Just before we close, though, write that
     // we've cleanly shutdown.
@@ -374,7 +427,6 @@ export class Hub implements HubInterface {
     if (peerIdResult.isErr()) {
       return Promise.resolve(err(peerIdResult.error));
     }
-    const peerId = peerIdResult.value;
 
     if (gossipMessage.message) {
       const message = gossipMessage.message;
@@ -389,25 +441,8 @@ export class Hub implements HubInterface {
         return err(new HubError('unavailable', 'Sync queue is full'));
       }
 
-      // Get the RPC Client to use to merge this message
-      const contactInfo = this.syncEngine.getContactInfoForPeerId(peerId.toString())?.contactInfo;
-      if (contactInfo) {
-        const rpcClient = await this.getRPCClientForPeer(peerId, contactInfo);
-        if (rpcClient) {
-          const results = await this.syncEngine.mergeMessages([message], rpcClient);
-          return Result.combine(results).map(() => undefined);
-        } else {
-          log.error('No RPC clients available to merge message, attempting to merge directly into the engine');
-          const result = await this.submitMessage(message, 'gossip');
-          return result.map(() => undefined);
-        }
-      } else {
-        log.error('No contact info available for peer, attempting to merge directly into the engine');
-        const result = await this.submitMessage(message, 'gossip');
-        return result.map(() => undefined);
-      }
-    } else if (gossipMessage.idRegistryEvent) {
-      const result = await this.submitIdRegistryEvent(gossipMessage.idRegistryEvent, 'gossip');
+      // Merge the message
+      const result = await this.submitMessage(message, 'gossip');
       return result.map(() => undefined);
     } else if (gossipMessage.contactInfoContent) {
       if (peerIdResult.isOk()) {
@@ -449,19 +484,47 @@ export class Hub implements HubInterface {
       }
     }
 
-    const rpcClient = await this.getRPCClientForPeer(peerId, message);
-    log.info({ identity: this.identity, peer: peerId }, 'received a Contact Info for sync');
+    log.info({ identity: this.identity, peer: peerId, message }, 'received a Contact Info for sync');
 
     // Check if we already have this client
-    if (rpcClient) {
-      if (this.syncEngine.getContactInfoForPeerId(peerId.toString())) {
-        log.info('Already have this client, skipping sync');
-        return;
-      } else {
-        this.syncEngine.addContactInfoForPeerId(peerId, message);
-        await this.syncEngine.diffSyncIfRequired(this, peerId.toString());
+    const peerInfo = this.syncEngine.getContactInfoForPeerId(peerId.toString());
+    if (peerInfo) {
+      log.info({ peerInfo }, 'Already have this peer, skipping sync');
+      return;
+    } else {
+      // If it is a new client, we do a sync against it
+      log.info({ peerInfo }, 'New Peer Contact Info, syncing');
+      this.syncEngine.addContactInfoForPeerId(peerId, message);
+      const syncResult = await ResultAsync.fromPromise(
+        this.syncEngine.diffSyncIfRequired(this, peerId.toString()),
+        (e) => e
+      );
+      if (syncResult.isErr()) {
+        log.error({ error: syncResult.error, peerId }, 'failed to sync with new peer');
       }
     }
+  }
+
+  /** Since we don't know if the peer is using SSL or not, we'll attempt to get the SSL version,
+   *  and fall back to the non-SSL version
+   */
+  private async getHubRpcClient(address: string): Promise<HubRpcClient> {
+    return new Promise((resolve) => {
+      try {
+        const sslClientResult = getSSLHubRpcClient(address);
+
+        sslClientResult.$.waitForReady(Date.now() + 2000, (err) => {
+          if (!err) {
+            resolve(sslClientResult);
+          } else {
+            resolve(getInsecureHubRpcClient(address));
+          }
+        });
+      } catch (e) {
+        // Fall back to insecure client
+        resolve(getInsecureHubRpcClient(address));
+      }
+    });
   }
 
   public async getRPCClientForPeer(peerId: PeerId, peer: ContactInfoContent): Promise<HubRpcClient | undefined> {
@@ -480,8 +543,13 @@ export class Hub implements HubInterface {
       return;
     }
 
-    if (isIP(rpcAddressInfo.value.address)) {
-      return await getHubRpcClient(`${rpcAddressInfo.value.address}:${rpcAddressInfo.value.port}`);
+    if (rpcAddressInfo.value.address) {
+      try {
+        return await this.getHubRpcClient(`${rpcAddressInfo.value.address}:${rpcAddressInfo.value.port}`);
+      } catch (e) {
+        log.error({ error: e, peer, peerId }, 'unable to connect to peer');
+        return undefined;
+      }
     }
 
     log.info({ peerId }, 'falling back to addressbook lookup for peer');
@@ -508,39 +576,15 @@ export class Hub implements HubInterface {
       port: rpcAddressInfo.value.port,
     };
 
-    return await getHubRpcClient(addressInfoToString(ai));
+    try {
+      return await this.getHubRpcClient(addressInfoToString(ai));
+    } catch (e) {
+      log.error({ error: e, peer, peerId, addressInfo: ai }, 'unable to connect to peer');
+      return undefined;
+    }
   }
 
   private registerEventHandlers() {
-    // Subscribe to store events
-    this.engine.eventHandler.on('mergeMessage', async (event: protobufs.MergeMessageHubEvent) => {
-      const message = event.mergeMessageBody.message;
-      if (protobufs.isSignerRemoveMessage(message)) {
-        const revokeSignerPayload = RevokeSignerJobQueue.makePayload(
-          message.data?.fid ?? 0,
-          message.data?.signerRemoveBody?.signer ?? new Uint8Array()
-        );
-        if (revokeSignerPayload.isOk()) {
-          // Revoke signer in one hour
-          await this.revokeSignerJobQueue.enqueueJob(revokeSignerPayload.value);
-        }
-      }
-    });
-
-    this.engine.eventHandler.on('mergeIdRegistryEvent', async (event: protobufs.MergeIdRegistryEventHubEvent) => {
-      const fromAddress = event.mergeIdRegistryEventBody.idRegistryEvent.from;
-      if (fromAddress && fromAddress.length > 0) {
-        const revokeSignerPayload = RevokeSignerJobQueue.makePayload(
-          event.mergeIdRegistryEventBody.idRegistryEvent.fid,
-          fromAddress
-        );
-        if (revokeSignerPayload.isOk()) {
-          // Revoke eth address in one hour
-          await this.revokeSignerJobQueue.enqueueJob(revokeSignerPayload.value);
-        }
-      }
-    });
-
     // Subscribes to all relevant topics
     this.gossipNode.gossip?.subscribe(NETWORK_TOPIC_PRIMARY);
     this.gossipNode.gossip?.subscribe(NETWORK_TOPIC_CONTACT);
@@ -604,7 +648,7 @@ export class Hub implements HubInterface {
         );
       },
       (e) => {
-        logMessage.error({ errCode: e.errCode }, `submitMessage error: ${e.message}`);
+        logMessage.warn({ errCode: e.errCode }, `submitMessage error: ${e.message}`);
       }
     );
 
@@ -625,7 +669,7 @@ export class Hub implements HubInterface {
         );
       },
       (e) => {
-        logEvent.error({ errCode: e.errCode }, `submitIdRegistryEvent error: ${e.message}`);
+        logEvent.warn({ errCode: e.errCode }, `submitIdRegistryEvent error: ${e.message}`);
       }
     );
 
@@ -646,7 +690,7 @@ export class Hub implements HubInterface {
         );
       },
       (e) => {
-        logEvent.error({ errCode: e.errCode }, `submitNameRegistryEvent error: ${e.message}`);
+        logEvent.warn({ errCode: e.errCode }, `submitNameRegistryEvent error: ${e.message}`);
       }
     );
 
