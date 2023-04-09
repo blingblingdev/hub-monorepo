@@ -1,6 +1,6 @@
 {
   "name": "@farcaster/hubble",
-  "version": "1.0.18",
+  "version": "1.0.22",
   "description": "Farcaster Hub",
   "author": "",
   "license": "",
@@ -23,6 +23,7 @@
     "lint:fix": "yarn run lint -- --fix",
     "start": "tsx src/cli.ts start",
     "identity": "tsx src/cli.ts identity",
+    "dbreset": "tsx src/cli.ts dbreset",
     "console": "tsx src/cli.ts console",
     "test": "yarn build && NODE_OPTIONS=--experimental-vm-modules jest",
     "test:ci": "ENVIRONMENT=test NODE_OPTIONS=--experimental-vm-modules jest --ci --forceExit --coverage"
@@ -47,8 +48,7 @@
   "dependencies": {
     "@chainsafe/libp2p-gossipsub": "6.1.0",
     "@chainsafe/libp2p-noise": "^11.0.0 ",
-    "@farcaster/protobufs": "0.1.11",
-    "@farcaster/utils": "0.4.0",
+    "@farcaster/hub-nodejs": "^0.6.3",
     "@grpc/grpc-js": "~1.8.7",
     "@libp2p/interface-connection": "^3.0.2",
     "@libp2p/interface-peer-id": "^2.0.0",

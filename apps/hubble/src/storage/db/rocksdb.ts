@@ -1,4 +1,4 @@
-import { bytesIncrement, HubError, isHubError } from '@farcaster/utils';
+import { bytesIncrement, HubError, isHubError } from '@farcaster/hub-nodejs';
 import { AbstractBatch, AbstractChainedBatch, AbstractIterator } from 'abstract-leveldown';
 import { mkdir } from 'fs';
 import AbstractRocksDB from 'rocksdb';
@@ -52,6 +52,8 @@ export class Iterator {
   }
 
   async end(): Promise<void> {
+    if (this._iterator._ended) return Promise.resolve(undefined);
+
     return new Promise((resolve, reject) => {
       this._iterator.end((err: Error | undefined) => {
         err ? reject(err) : resolve(undefined);

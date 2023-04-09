@@ -3,21 +3,15 @@ import {
   CastId,
   CastRemoveMessage,
   FidsResponse,
-  Server as GrpcServer,
   HubEvent,
   HubEventType,
   HubInfoResponse,
-  HubServiceServer,
-  HubServiceService,
   IdRegistryEvent,
   Message,
   MessagesResponse,
-  Metadata,
   NameRegistryEvent,
   ReactionAddMessage,
   ReactionRemoveMessage,
-  ServerCredentials,
-  ServiceError,
   SignerAddMessage,
   SignerRemoveMessage,
   SyncIds,
@@ -26,11 +20,18 @@ import {
   UserDataAddMessage,
   VerificationAddEthAddressMessage,
   VerificationRemoveMessage,
+  ServerCredentials,
+  ServiceError,
+  Metadata,
+  HubServiceServer,
+  HubAsyncResult,
+  HubError,
+  HubServiceService,
+  Server as GrpcServer,
   getServer,
   status,
-} from '@farcaster/protobufs';
-import { HubAsyncResult, HubError } from '@farcaster/utils';
-import { err, ok, Result } from 'neverthrow';
+} from '@farcaster/hub-nodejs';
+import { err, ok, Result, ResultAsync } from 'neverthrow';
 import { APP_NICKNAME, APP_VERSION, HubInterface } from '~/hubble';
 import { GossipNode } from '~/network/p2p/gossipNode';
 import { NodeMetadata } from '~/network/sync/merkleTrie';
@@ -40,6 +41,10 @@ import { MessagesPage } from '~/storage/stores/types';
 import { logger } from '~/utils/logger';
 import { addressInfoFromParts } from '~/utils/p2p';
 import { RateLimiterMemory, RateLimiterAbstract } from 'rate-limiter-flexible';
+import { BufferedStreamWriter } from './bufferedStreamWriter';
+import { sleep } from '~/utils/crypto';
+
+export type RpcUsers = Map<string, string[]>;
 
 const log = logger.child({ component: 'rpcServer' });
 
@@ -56,13 +61,9 @@ export const rateLimitByIp = async (ip: string, limiter: RateLimiterAbstract): H
 };
 
 // Check if the user is authenticated via the metadata
-export const authenticateUser = async (
-  metadata: Metadata,
-  rpcAuthUser?: string,
-  rpcAuthPass?: string
-): HubAsyncResult<boolean> => {
+export const authenticateUser = async (metadata: Metadata, rpcUsers: RpcUsers): HubAsyncResult<boolean> => {
   // If there is no auth user/pass, we don't need to authenticate
-  if (!rpcAuthUser || !rpcAuthPass) {
+  if (rpcUsers.size === 0) {
     return ok(true);
   }
 
@@ -79,11 +80,17 @@ export const authenticateUser = async (
       return err(new HubError('unauthenticated', `Invalid username: ${username}`));
     }
 
-    if (username === rpcAuthUser && password === rpcAuthPass) {
-      return ok(true);
-    } else {
+    // See if username and password match one of rpcUsers
+    const allowedPasswords = rpcUsers.get(username);
+    if (!allowedPasswords) {
+      return err(new HubError('unauthenticated', `Invalid username: ${username}`));
+    }
+
+    if (!allowedPasswords.includes(password)) {
       return err(new HubError('unauthenticated', `Invalid password for user: ${username}`));
     }
+
+    return ok(true);
   }
   return err(new HubError('unauthenticated', 'No authorization header'));
 };
@@ -130,6 +137,28 @@ const messagesPageToResponse = ({ messages, nextPageToken }: MessagesPage<Messag
   });
 };
 
+export const getRPCUsersFromAuthString = (rpcAuth?: string): Map<string, string[]> => {
+  if (!rpcAuth) {
+    return new Map();
+  }
+
+  // Split up the auth string by commas
+  const rpcAuthUsers = rpcAuth?.split(',') ?? [];
+
+  // Create a map of username to all the passwords for that user
+  const rpcUsers = new Map();
+  rpcAuthUsers.forEach((rpcAuthUser) => {
+    const [username, password] = rpcAuthUser.split(':');
+    if (username && password) {
+      const passwords = rpcUsers.get(username) ?? [];
+      passwords.push(password);
+      rpcUsers.set(username, passwords);
+    }
+  });
+
+  return rpcUsers;
+};
+
 export default class Server {
   private hub: HubInterface | undefined;
   private engine: Engine | undefined;
@@ -137,10 +166,10 @@ export default class Server {
   private gossipNode: GossipNode | undefined;
 
   private grpcServer: GrpcServer;
+  private listenIp: string;
   private port: number;
 
-  private rpcAuthUser: string | undefined;
-  private rpcAuthPass: string | undefined;
+  private rpcUsers: RpcUsers;
 
   private submitMessageRateLimiter: RateLimiterMemory;
 
@@ -158,14 +187,14 @@ export default class Server {
     this.gossipNode = gossipNode;
 
     this.grpcServer = getServer();
+
+    this.listenIp = '';
     this.port = 0;
 
-    const [rpcAuthUser, rpcAuthPass] = rpcAuth?.split(':') ?? [undefined, undefined];
-    if (rpcAuthUser && rpcAuthPass) {
-      this.rpcAuthUser = rpcAuthUser;
-      this.rpcAuthPass = rpcAuthPass;
+    this.rpcUsers = getRPCUsersFromAuthString(rpcAuth);
 
-      log.info({ username: this.rpcAuthUser }, 'RPC auth enabled');
+    if (this.rpcUsers.size > 0) {
+      log.info({ num_users: this.rpcUsers.size }, 'RPC auth enabled');
     }
 
     this.grpcServer.addService(HubServiceService, this.getImpl());
@@ -182,14 +211,16 @@ export default class Server {
     });
   }
 
-  async start(port = 0): Promise<number> {
+  async start(ip = '0.0.0.0', port = 0): Promise<number> {
     return new Promise((resolve, reject) => {
-      this.grpcServer.bindAsync(`0.0.0.0:${port}`, ServerCredentials.createInsecure(), (err, port) => {
+      this.grpcServer.bindAsync(`${ip}:${port}`, ServerCredentials.createInsecure(), (err, port) => {
         if (err) {
           logger.error({ component: 'gRPC Server', err }, 'Failed to start gRPC Server');
           reject(err);
         } else {
           this.grpcServer.start();
+
+          this.listenIp = ip;
           this.port = port;
 
           logger.info({ component: 'gRPC Server', address: this.address }, 'Starting gRPC Server');
@@ -220,12 +251,12 @@ export default class Server {
   }
 
   get address() {
-    const addr = addressInfoFromParts('0.0.0.0', this.port);
+    const addr = addressInfoFromParts(this.listenIp, this.port);
     return addr;
   }
 
   get auth() {
-    return { user: this.rpcAuthUser, password: this.rpcAuthPass };
+    return this.rpcUsers;
   }
 
   get listenPort() {
@@ -362,10 +393,12 @@ export default class Server {
         }
 
         // Authentication
-        const authResult = await authenticateUser(call.metadata, this.rpcAuthUser, this.rpcAuthPass);
+        const authResult = await authenticateUser(call.metadata, this.rpcUsers);
         if (authResult.isErr()) {
           logger.warn({ errMsg: authResult.error.message }, 'submitMessage failed');
-          callback(toServiceError(new HubError('unauthenticated', 'User is not authenticated')));
+          callback(
+            toServiceError(new HubError('unauthenticated', `gRPC authentication failed: ${authResult.error.message}`))
+          );
           return;
         }
 
@@ -594,11 +627,22 @@ export default class Server {
       },
       getIdRegistryEvent: async (call, callback) => {
         const request = call.request;
-
-        const custodyEventResult = await this.engine?.getIdRegistryEvent(request.fid);
-        custodyEventResult?.match(
-          (custodyEvent: IdRegistryEvent) => {
-            callback(null, custodyEvent);
+        const idRegistryEventResult = await this.engine?.getIdRegistryEvent(request.fid);
+        idRegistryEventResult?.match(
+          (idRegistryEvent: IdRegistryEvent) => {
+            callback(null, idRegistryEvent);
+          },
+          (err: HubError) => {
+            callback(toServiceError(err));
+          }
+        );
+      },
+      getIdRegistryEventByAddress: async (call, callback) => {
+        const request = call.request;
+        const idRegistryEventResult = await this.engine?.getIdRegistryEventByAddress(request.address);
+        idRegistryEventResult?.match(
+          (idRegistryEvent: IdRegistryEvent) => {
+            callback(null, idRegistryEvent);
           },
           (err: HubError) => {
             callback(toServiceError(err));
@@ -712,25 +756,78 @@ export default class Server {
       subscribe: async (stream) => {
         const { request } = stream;
 
-        if (this.engine && request.fromId) {
+        // We'll write using a Buffered Stream Writer
+        const bufferedStreamWriter = new BufferedStreamWriter(stream);
+
+        // We'll listen to all events and write them to the stream as they happen
+        const eventListener = (event: HubEvent) => {
+          bufferedStreamWriter.writeToStream(event);
+        };
+
+        stream.on('cancelled', () => {
+          stream.destroy();
+        });
+
+        // Register a close listener to remove all listeners before we start sending events
+        stream.on('close', () => {
+          this.engine?.eventHandler.off('mergeMessage', eventListener);
+          this.engine?.eventHandler.off('pruneMessage', eventListener);
+          this.engine?.eventHandler.off('revokeMessage', eventListener);
+          this.engine?.eventHandler.off('mergeIdRegistryEvent', eventListener);
+          this.engine?.eventHandler.off('mergeNameRegistryEvent', eventListener);
+        });
+
+        // If the user wants to start from a specific event, we'll start from there first
+        if (this.engine && request.fromId !== undefined && request.fromId >= 0) {
           const eventsIterator = this.engine.eventHandler.getEventsIterator({ fromId: request.fromId });
           if (eventsIterator.isErr()) {
             stream.destroy(eventsIterator.error);
             return;
           }
+
+          // Track our RSS usage, to detect a situation where we're writing a lot of data to the stream,
+          // but the client is not reading it. If we detect this, we'll stop writing to the stream.
+          // Right now, we don't act on it, but we'll log it for now. We could potentially
+          // destroy() the stream.
+          const rssUsage = process.memoryUsage().rss;
+          const RSS_USAGE_THRESHOLD = 1_000_000_000; // 1G
+
           for await (const [, value] of eventsIterator.value) {
             const event = HubEvent.decode(Uint8Array.from(value as Buffer));
             if (request.eventTypes.length === 0 || request.eventTypes.includes(event.type)) {
-              stream.write(event);
+              const writeResult = bufferedStreamWriter.writeToStream(event);
+
+              if (writeResult.isErr()) {
+                logger.warn(
+                  { err: writeResult.error },
+                  `subscribe: failed to write to stream while returning events ${request.fromId}`
+                );
+
+                // If the iterator throws, it is already closed, so it doesn't matter.
+                await ResultAsync.fromPromise(eventsIterator.value.end(), (e) => e as Error);
+
+                return;
+              } else {
+                if (writeResult._unsafeUnwrap() === false) {
+                  // If the stream was buffered, we can wait for a bit before continuing
+                  // to allow the client to read the data. If this happens too much, the bufferedStreamWriter
+                  // will timeout and destroy the stream.
+                  await sleep(10);
+                }
+
+                // Write was successful, check the RSS usage
+                if (process.memoryUsage().rss > rssUsage + RSS_USAGE_THRESHOLD) {
+                  // more than 1G
+                  logger.warn(
+                    `subscribe: RSS usage increased by more than 1GB while returning events to ${stream.getPeer()}`
+                  );
+                }
+              }
             }
           }
         }
 
-        const eventListener = (event: HubEvent) => {
-          stream.write(event);
-        };
-
-        // if no type filters are provided, subscribe to all event types
+        // if no type filters are provided, subscribe to all event types and start streaming events
         if (request.eventTypes.length === 0) {
           this.engine?.eventHandler.on('mergeMessage', eventListener);
           this.engine?.eventHandler.on('pruneMessage', eventListener);
@@ -752,18 +849,6 @@ export default class Server {
             }
           }
         }
-
-        stream.on('cancelled', () => {
-          stream.destroy();
-        });
-
-        stream.on('close', () => {
-          this.engine?.eventHandler.off('mergeMessage', eventListener);
-          this.engine?.eventHandler.off('pruneMessage', eventListener);
-          this.engine?.eventHandler.off('revokeMessage', eventListener);
-          this.engine?.eventHandler.off('mergeIdRegistryEvent', eventListener);
-          this.engine?.eventHandler.off('mergeNameRegistryEvent', eventListener);
-        });
       },
     };
   };

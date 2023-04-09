@@ -1,7 +1,6 @@
 import { gossipsub, GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { noise } from '@chainsafe/libp2p-noise';
-import * as protobufs from '@farcaster/protobufs';
-import { HubAsyncResult, HubError, HubResult } from '@farcaster/utils';
+import { ContactInfoContent, GossipMessage, HubAsyncResult, HubError, HubResult, Message } from '@farcaster/hub-nodejs';
 import { Connection } from '@libp2p/interface-connection';
 import { PeerId } from '@libp2p/interface-peer-id';
 import { mplex } from '@libp2p/mplex';
@@ -15,6 +14,7 @@ import { ConnectionFilter } from '~/network/p2p/connectionFilter';
 import { GOSSIP_TOPICS, NETWORK_TOPIC_PRIMARY } from '~/network/p2p/protocol';
 import { logger } from '~/utils/logger';
 import { addressInfoFromParts, checkNodeAddrs, ipMultiAddrStrFromAddressInfo } from '~/utils/p2p';
+import { PeriodicPeerCheckScheduler } from './periodicPeerCheck';
 
 const MultiaddrLocalHost = '/ip4/127.0.0.1';
 
@@ -26,7 +26,7 @@ const log = logger.child({ component: 'Node' });
 /** Events emitted by a Farcaster Gossip Node */
 interface NodeEvents {
   /** Triggers on receipt of a new message and includes the topic and message contents */
-  message: (topic: string, message: HubResult<protobufs.GossipMessage>) => void;
+  message: (topic: string, message: HubResult<GossipMessage>) => void;
   /** Triggers when a peer connects and includes the libp2p Connection object*/
   peerConnect: (connection: Connection) => void;
   /** Triggers when a peer disconnects and includes the libp2p Connection object */
@@ -56,6 +56,7 @@ interface NodeOptions {
  */
 export class GossipNode extends TypedEmitter<NodeEvents> {
   private _node?: Libp2p;
+  private _periodicPeerCheckJob?: PeriodicPeerCheckScheduler;
 
   /** Returns the PeerId (public key) of this node */
   get peerId() {
@@ -72,6 +73,39 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
     return this._node?.peerStore.addressBook;
   }
 
+  async addPeerToAddressBook(peerId: PeerId, multiaddr: Multiaddr) {
+    if (!this.addressBook) {
+      log.error({}, 'address book missing for gossipNode');
+    } else {
+      const addResult = await ResultAsync.fromPromise(
+        this.addressBook.add(peerId, [multiaddr]),
+        (error) => new HubError('unavailable', error as Error)
+      );
+      if (addResult.isErr()) {
+        log.error({ error: addResult.error, peerId }, 'failed to add contact info to address book');
+      }
+    }
+  }
+
+  /** Removes the peer from the address book and hangs up on them */
+  async removePeerFromAddressBook(peerId: PeerId) {
+    if (this._node) {
+      const hangupResult = await ResultAsync.fromPromise(
+        this._node.hangUp(peerId),
+        (error) => new HubError('unavailable', error as Error)
+      );
+      if (hangupResult.isErr()) {
+        log.error({ error: hangupResult.error, peerId }, 'failed to hang up peer');
+      }
+    }
+
+    if (!this.addressBook) {
+      log.error({}, 'address book missing for gossipNode');
+    } else {
+      return this.addressBook.delete(peerId);
+    }
+  }
+
   /** Returns the libp2p Peer instance after updating the connections in the AddressBook */
   async getPeerInfo(peerId: PeerId) {
     const existingConnections = this._node?.getConnections(peerId);
@@ -81,7 +115,7 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
         await this._node?.peerStore.addressBook.add(peerId, [conn.remoteAddr]);
       }
     }
-    return await this._node?.peerStore.get(peerId);
+    return this._node?.peerStore.get(peerId);
   }
 
   /** Returns the GossipSub instance used by the Node */
@@ -114,6 +148,9 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
     // Wait for a few seconds for everything to initialize before connecting to bootstrap nodes
     setTimeout(() => this.bootstrap(bootstrapAddrs), 1 * 1000);
 
+    // Also start the periodic job to make sure we have peers
+    this._periodicPeerCheckJob = new PeriodicPeerCheckScheduler(this, bootstrapAddrs);
+
     return ok(undefined);
   }
 
@@ -124,6 +161,8 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
   /** Removes the node from the libp2p network and tears down pubsub */
   async stop() {
     await this._node?.stop();
+    this._periodicPeerCheckJob?.stop();
+
     log.info({ identity: this.identity }, 'Stopped libp2p...');
   }
 
@@ -132,8 +171,8 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
   }
 
   /** Serializes and publishes a Farcaster Message to the network */
-  async gossipMessage(message: protobufs.Message) {
-    const gossipMessage = protobufs.GossipMessage.create({
+  async gossipMessage(message: Message) {
+    const gossipMessage = GossipMessage.create({
       message,
       topics: [NETWORK_TOPIC_PRIMARY],
       peerId: this.peerId?.toBytes() ?? new Uint8Array(),
@@ -142,8 +181,8 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
   }
 
   /** Serializes and publishes this node's ContactInfo to the network */
-  async gossipContactInfo(contactInfo: protobufs.ContactInfoContent) {
-    const gossipMessage = protobufs.GossipMessage.create({
+  async gossipContactInfo(contactInfo: ContactInfoContent) {
+    const gossipMessage = GossipMessage.create({
       contactInfoContent: contactInfo,
       topics: [NETWORK_TOPIC_PRIMARY],
       peerId: this.peerId?.toBytes() ?? new Uint8Array(),
@@ -152,7 +191,7 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
   }
 
   /** Publishes a Gossip Message to the network */
-  async publish(message: protobufs.GossipMessage) {
+  async publish(message: GossipMessage) {
     const topics = message.topics;
     const encodedMessage = GossipNode.encodeMessage(message);
 
@@ -190,6 +229,7 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
     log.debug({ identity: this.identity, address }, `Attempting to connect to address ${address}`);
     try {
       const conn = await this._node?.dial(address);
+
       if (conn) {
         log.info({ identity: this.identity, address }, `Connected to peer at address: ${address}`);
         return ok(undefined);
@@ -242,14 +282,14 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
   }
 
   //TODO: Needs better typesafety
-  static encodeMessage(message: protobufs.GossipMessage): HubResult<Uint8Array> {
-    return ok(protobufs.GossipMessage.encode(message).finish());
+  static encodeMessage(message: GossipMessage): HubResult<Uint8Array> {
+    return ok(GossipMessage.encode(message).finish());
   }
 
   //TODO: Needs better typesafety
-  static decodeMessage(message: Uint8Array): HubResult<protobufs.GossipMessage> {
+  static decodeMessage(message: Uint8Array): HubResult<GossipMessage> {
     // Convert GossipMessage to Uint8Array or decode will return nested Uint8Arrays as Buffers
-    return ok(protobufs.GossipMessage.decode(Uint8Array.from(message)));
+    return ok(GossipMessage.decode(Uint8Array.from(message)));
   }
 
   /* -------------------------------------------------------------------------- */
@@ -257,7 +297,7 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
   /* -------------------------------------------------------------------------- */
 
   /* Attempts to dial all the addresses in the bootstrap list */
-  private async bootstrap(bootstrapAddrs: Multiaddr[]): Promise<HubResult<void>> {
+  public async bootstrap(bootstrapAddrs: Multiaddr[]): Promise<HubResult<void>> {
     if (bootstrapAddrs.length == 0) return ok(undefined);
     const results = await Promise.all(bootstrapAddrs.map((addr) => this.connectAddress(addr)));
 

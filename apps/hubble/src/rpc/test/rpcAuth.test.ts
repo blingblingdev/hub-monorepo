@@ -1,6 +1,14 @@
-import * as protobufs from '@farcaster/protobufs';
 import { RateLimiterMemory } from 'rate-limiter-flexible';
-import { Factories, getInsecureHubRpcClient, HubError } from '@farcaster/utils';
+import {
+  Factories,
+  HubError,
+  getInsecureHubRpcClient,
+  Metadata,
+  FarcasterNetwork,
+  IdRegistryEvent,
+  SignerAddMessage,
+  Empty,
+} from '@farcaster/hub-nodejs';
 import SyncEngine from '~/network/sync/syncEngine';
 
 import Server, { rateLimitByIp } from '~/rpc/server';
@@ -10,7 +18,7 @@ import { MockHub } from '~/test/mocks';
 import { sleep } from '~/utils/crypto';
 
 const db = jestRocksDB('protobufs.rpcAuth.test');
-const network = protobufs.FarcasterNetwork.TESTNET;
+const network = FarcasterNetwork.TESTNET;
 const engine = new Engine(db, network);
 const hub = new MockHub(db, engine);
 
@@ -18,8 +26,8 @@ const fid = Factories.Fid.build();
 const signer = Factories.Ed25519Signer.build();
 const custodySigner = Factories.Eip712Signer.build();
 
-let custodyEvent: protobufs.IdRegistryEvent;
-let signerAdd: protobufs.SignerAddMessage;
+let custodyEvent: IdRegistryEvent;
+let signerAdd: SignerAddMessage;
 
 beforeAll(async () => {
   const signerKey = (await signer.getSignerKey())._unsafeUnwrap();
@@ -46,32 +54,38 @@ describe('auth tests', () => {
 
     // No password
     const result = await authClient.submitMessage(signerAdd);
-    expect(result._unsafeUnwrapErr()).toEqual(new HubError('unauthorized', 'User is not authenticated'));
+    expect(result._unsafeUnwrapErr()).toEqual(
+      new HubError('unauthorized', 'gRPC authentication failed: Authorization header is empty')
+    );
 
     // Wrong password
-    const metadata = new protobufs.Metadata();
+    const metadata = new Metadata();
     metadata.set('authorization', `Basic ${Buffer.from(`admin:wrongpassword`).toString('base64')}`);
     const result2 = await authClient.submitMessage(signerAdd, metadata);
-    expect(result2._unsafeUnwrapErr()).toEqual(new HubError('unauthorized', 'User is not authenticated'));
+    expect(result2._unsafeUnwrapErr()).toEqual(
+      new HubError('unauthorized', 'gRPC authentication failed: Invalid password for user: admin')
+    );
 
     // Wrong username
-    const metadata2 = new protobufs.Metadata();
+    const metadata2 = new Metadata();
     metadata2.set('authorization', `Basic ${Buffer.from(`wronguser:password`).toString('base64')}`);
     const result3 = await authClient.submitMessage(signerAdd, metadata2);
-    expect(result3._unsafeUnwrapErr()).toEqual(new HubError('unauthorized', 'User is not authenticated'));
+    expect(result3._unsafeUnwrapErr()).toEqual(
+      new HubError('unauthorized', 'gRPC authentication failed: Invalid username: wronguser')
+    );
 
     // Right password
-    const metadata3 = new protobufs.Metadata();
+    const metadata3 = new Metadata();
     metadata3.set('authorization', `Basic ${Buffer.from(`admin:password`).toString('base64')}`);
     const result4 = await authClient.submitMessage(signerAdd, metadata3);
     expect(result4.isOk()).toBeTruthy();
 
     // Non submit methods work without auth
-    const result5 = await authClient.getInfo(protobufs.Empty.create());
+    const result5 = await authClient.getInfo(Empty.create());
     expect(result5.isOk()).toBeTruthy();
 
     await authServer.stop();
-    authClient.$.close();
+    authClient.close();
   });
 
   test('all submit methods require auth', async () => {
@@ -83,17 +97,19 @@ describe('auth tests', () => {
 
     // Without auth fails
     const result1 = await authClient.submitMessage(signerAdd);
-    expect(result1._unsafeUnwrapErr()).toEqual(new HubError('unauthorized', 'User is not authenticated'));
+    expect(result1._unsafeUnwrapErr()).toEqual(
+      new HubError('unauthorized', 'gRPC authentication failed: Authorization header is empty')
+    );
 
     // Works with auth
-    const metadata = new protobufs.Metadata();
+    const metadata = new Metadata();
     metadata.set('authorization', `Basic ${Buffer.from(`admin:password`).toString('base64')}`);
 
     const result2 = await authClient.submitMessage(signerAdd, metadata);
     expect(result2.isOk()).toBeTruthy();
 
     await authServer.stop();
-    authClient.$.close();
+    authClient.close();
   });
 
   test('test rate limiting', async () => {

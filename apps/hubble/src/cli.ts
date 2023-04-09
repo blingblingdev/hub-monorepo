@@ -1,18 +1,18 @@
 #!/usr/bin/env node
-import { FarcasterNetwork } from '@farcaster/protobufs';
+import { FarcasterNetwork } from '@farcaster/hub-nodejs';
 import { PeerId } from '@libp2p/interface-peer-id';
 import { createEd25519PeerId, createFromProtobuf, exportToProtobuf } from '@libp2p/peer-id-factory';
 import { Command } from 'commander';
 import fs, { existsSync } from 'fs';
 import { mkdir, readFile, writeFile } from 'fs/promises';
-import { ResultAsync } from 'neverthrow';
+import { Result, ResultAsync } from 'neverthrow';
 import { dirname, resolve } from 'path';
 import { exit } from 'process';
 import { APP_VERSION, Hub, HubOptions } from '~/hubble';
 import { logger } from '~/utils/logger';
 import { addressInfoFromParts, ipMultiAddrStrFromAddressInfo, parseAddress } from '~/utils/p2p';
 import { DEFAULT_RPC_CONSOLE, startConsole } from './console/console';
-import { DB_DIRECTORY } from './storage/db/rocksdb';
+import RocksDB, { DB_DIRECTORY } from './storage/db/rocksdb';
 import { parseNetwork } from './utils/command';
 
 /** A CLI to accept options from the user and start the Hub */
@@ -23,6 +23,9 @@ const DEFAULT_PEER_ID_DIR = './.hub';
 const DEFAULT_PEER_ID_FILENAME = `default_${PEER_ID_FILENAME}`;
 const DEFAULT_PEER_ID_LOCATION = `${DEFAULT_PEER_ID_DIR}/${DEFAULT_PEER_ID_FILENAME}`;
 const DEFAULT_CHUNK_SIZE = 10000;
+
+const DEFAULT_GOSSIP_PORT = 2282;
+const DEFAULT_RPC_PORT = 2283;
 
 // Grace period before exiting the process after receiving a SIGINT or SIGTERM
 const PROCESS_SHUTDOWN_FILE_CHECK_INTERVAL_MS = 10_000;
@@ -58,7 +61,7 @@ app
   .option('-g, --gossip-port <port>', 'The tcp port libp2p should gossip over. (default: 2282)')
   .option('-r, --rpc-port <port>', 'The tcp port that the rpc server should listen on.  (default: 2283)')
   .option(
-    '--rpc-auth <username:password>',
+    '--rpc-auth <username:password,...>',
     'Enable Auth for RPC submit methods with the username and password. (default: disabled)'
   )
   .option(
@@ -68,7 +71,6 @@ app
   .option('--admin-server-enabled', 'Enable the admin server. (default: disabled)')
   .option('--admin-server-host <host>', "The host the admin server should listen on. (default: '127.0.0.1')")
   .option('--db-name <name>', 'The name of the RocksDB instance')
-  .option('--db-reset', 'Clears the database before starting')
   .option('--rebuild-sync-trie', 'Rebuilds the sync trie before starting')
   .option('-i, --id <filepath>', 'Path to the PeerId file')
   .option('-n --network <network>', 'Farcaster network ID', parseNetwork)
@@ -146,7 +148,14 @@ app
     // Read PeerID from 1. CLI option, 2. Environment variable, 3. Config file
     let peerId;
     if (cliOptions.id) {
-      peerId = await readPeerId(resolve(cliOptions.id));
+      const peerIdR = await ResultAsync.fromPromise(readPeerId(resolve(cliOptions.id)), (e) => e);
+      if (peerIdR.isErr()) {
+        throw new Error(
+          `Failed to read identity from ${cliOptions.id}: ${peerIdR.error}.\nPlease run "yarn identity create" to create a new identity.`
+        );
+      } else {
+        peerId = peerIdR.value;
+      }
     } else if (process.env['IDENTITY_B64']) {
       // Read from the environment variable
       const identityProtoBytes = Buffer.from(process.env['IDENTITY_B64'], 'base64');
@@ -161,7 +170,14 @@ app
       peerId = peerIdResult.value;
       logger.info({ identity: peerId.toString() }, 'Read identity from environment');
     } else {
-      peerId = await readPeerId(resolve(hubConfig.id));
+      const peerIdR = await ResultAsync.fromPromise(readPeerId(resolve(hubConfig.id)), (e) => e);
+      if (peerIdR.isErr()) {
+        throw new Error(
+          `Failed to read identity from ${cliOptions.id}: ${peerIdR.error}.\nPlease run "yarn identity create" to create a new identity.`
+        );
+      } else {
+        peerId = peerIdR.value;
+      }
     }
 
     // Read RPC Auth from 1. CLI option, 2. Environment variable, 3. Config file
@@ -175,6 +191,7 @@ app
     }
 
     // Check if the DB_RESET_TOKEN env variable is set. If it is, we might need to reset the DB.
+    let resetDB = false;
     const dbResetToken = process.env['DB_RESET_TOKEN'];
     if (dbResetToken) {
       // Read the contents of the "db_reset_token.txt" file, and if the number is
@@ -194,7 +211,7 @@ app
 
         // Reset the DB
         logger.warn({ dbResetTokenFileContents, dbResetToken }, 'Resetting DB since DB_RESET_TOKEN was set');
-        cliOptions.dbReset = true;
+        resetDB = true;
       }
     }
 
@@ -220,7 +237,7 @@ app
 
     const hubAddressInfo = addressInfoFromParts(
       cliOptions.ip ?? hubConfig.ip,
-      cliOptions.gossipPort ?? hubConfig.gossipPort
+      cliOptions.gossipPort ?? hubConfig.gossipPort ?? DEFAULT_GOSSIP_PORT
     );
 
     if (hubAddressInfo.isErr()) {
@@ -251,6 +268,7 @@ app
     const options: HubOptions = {
       peerId,
       ipMultiAddr: ipMultiAddrResult.value,
+      rpcServerHost: hubAddressInfo.value.address,
       announceIp: cliOptions.announceIp ?? hubConfig.announceIp,
       announceServerName: cliOptions.announceServerName ?? hubConfig.announceServerName,
       gossipPort: hubAddressInfo.value.port,
@@ -262,17 +280,28 @@ app
       chunkSize: cliOptions.chunkSize ?? hubConfig.chunkSize ?? DEFAULT_CHUNK_SIZE,
       bootstrapAddrs,
       allowedPeers: cliOptions.allowedPeers ?? hubConfig.allowedPeers,
-      rpcPort: cliOptions.rpcPort ?? hubConfig.rpcPort,
+      rpcPort: cliOptions.rpcPort ?? hubConfig.rpcPort ?? DEFAULT_RPC_PORT,
       rpcAuth,
       rocksDBName: cliOptions.dbName ?? hubConfig.dbName,
-      resetDB: cliOptions.dbReset ?? hubConfig.dbReset,
+      resetDB,
       rebuildSyncTrie,
       adminServerEnabled: cliOptions.adminServerEnabled ?? hubConfig.adminServerEnabled,
       adminServerHost: cliOptions.adminServerHost ?? hubConfig.adminServerHost,
       testUsers,
     };
 
-    const hub = new Hub(options);
+    const hubResult = Result.fromThrowable(
+      () => new Hub(options),
+      (e) => new Error(`Failed to create hub: ${e}`)
+    )();
+    if (hubResult.isErr()) {
+      logger.fatal(hubResult.error);
+      logger.fatal({ reason: 'Hub Creation failed' }, 'shutting down hub');
+
+      process.exit(1);
+    }
+
+    const hub = hubResult.value;
     const startResult = await ResultAsync.fromPromise(hub.start(), (e) => new Error(`Failed to start hub: ${e}`));
     if (startResult.isErr()) {
       logger.fatal(startResult.error);
@@ -357,6 +386,31 @@ const createIdCommand = new Command('create')
       const path = `${options.output}/${peerId.toString()}_${PEER_ID_FILENAME}`;
       await writePeerId(peerId, resolve(path));
     }
+
+    exit(0);
+  });
+
+app
+  .command('dbreset')
+  .description('Completely remove the database')
+  .option('--db-name <name>', 'The name of the RocksDB instance')
+  .option('-c, --config <filepath>', 'Path to a config file with options', DEFAULT_CONFIG_FILE)
+  .action(async (cliOptions) => {
+    const hubConfig = (await import(resolve(cliOptions.config))).Config;
+    const rocksDBName = cliOptions.dbName ?? hubConfig.dbName ?? '';
+
+    if (!rocksDBName) throw new Error('No RocksDB name provided.');
+
+    const rocksDB = new RocksDB(rocksDBName);
+    const dbResult = await ResultAsync.fromPromise(rocksDB.open(), (e) => e as Error);
+    if (dbResult.isErr()) {
+      logger.error({ rocksDBName }, 'Failed to open RocksDB');
+      exit(1);
+    }
+    await rocksDB.clear();
+
+    await rocksDB.close();
+    logger.info({ rocksDBName }, 'Database cleared.');
 
     exit(0);
   });

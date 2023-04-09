@@ -1,5 +1,12 @@
-import * as protobufs from '@farcaster/protobufs';
-import { Factories, getInsecureHubRpcClient, HubRpcClient } from '@farcaster/utils';
+import {
+  Factories,
+  getInsecureHubRpcClient,
+  HubRpcClient,
+  FarcasterNetwork,
+  IdRegistryEvent,
+  SignerAddMessage,
+  Message,
+} from '@farcaster/hub-nodejs';
 import { multiaddr } from '@multiformats/multiaddr/';
 import { GossipNode } from '~/network/p2p/gossipNode';
 import Server from '~/rpc/server';
@@ -7,6 +14,8 @@ import { jestRocksDB } from '~/storage/db/jestUtils';
 import Engine from '~/storage/engine';
 import { MockHub } from '~/test/mocks';
 import SyncEngine from '../sync/syncEngine';
+import { PeerId } from '@libp2p/interface-peer-id';
+import { sleep } from '~/utils/crypto';
 
 const TEST_TIMEOUT_SHORT = 10 * 1000;
 
@@ -85,9 +94,40 @@ describe('GossipNode', () => {
     TEST_TIMEOUT_SHORT
   );
 
+  test('removing from addressbook hangs up connection', async () => {
+    const node1 = new GossipNode();
+    await node1.start([]);
+
+    const node2 = new GossipNode();
+    await node2.start([]);
+
+    try {
+      const dialResult = await node1.connect(node2);
+      expect(dialResult.isOk()).toBeTruthy();
+
+      let other = await node1.addressBook?.get(node2.peerId as PeerId);
+      expect(other?.length).toEqual(1);
+
+      await node1.removePeerFromAddressBook(node2.peerId as PeerId);
+
+      // Sleep to allow the connection to be closed
+      await sleep(1000);
+
+      // Make sure the connection is closed
+      other = await node1.addressBook?.get(node2.peerId as PeerId);
+      expect(other).toEqual([]);
+
+      other = await node2.addressBook?.get(node1.peerId as PeerId);
+      expect(other).toEqual([]);
+    } finally {
+      await node1.stop();
+      await node2.stop();
+    }
+  });
+
   describe('gossip messages', () => {
     const db = jestRocksDB('protobufs.rpc.gossipMessageTest.test');
-    const network = protobufs.FarcasterNetwork.TESTNET;
+    const network = FarcasterNetwork.TESTNET;
     const engine = new Engine(db, network);
     const hub = new MockHub(db, engine);
     const fid = Factories.Fid.build();
@@ -96,9 +136,9 @@ describe('GossipNode', () => {
 
     let server: Server;
     let client: HubRpcClient;
-    let custodyEvent: protobufs.IdRegistryEvent;
-    let signerAdd: protobufs.SignerAddMessage;
-    let castAdd: protobufs.Message;
+    let custodyEvent: IdRegistryEvent;
+    let signerAdd: SignerAddMessage;
+    let castAdd: Message;
 
     beforeAll(async () => {
       const signerKey = (await signer.getSignerKey())._unsafeUnwrap();
@@ -120,7 +160,7 @@ describe('GossipNode', () => {
     test('gossip messages only from rpc', async () => {
       let numMessagesGossiped = 0;
       const mockGossipNode = {
-        gossipMessage: (_msg: protobufs.Message) => {
+        gossipMessage: (_msg: Message) => {
           numMessagesGossiped += 1;
         },
       } as unknown as GossipNode;
@@ -144,7 +184,7 @@ describe('GossipNode', () => {
       await hub.submitMessage(castAdd2);
       expect(numMessagesGossiped).toEqual(0);
 
-      client.$.close();
+      client.close();
       await server.stop();
       await syncEngine.stop();
     });

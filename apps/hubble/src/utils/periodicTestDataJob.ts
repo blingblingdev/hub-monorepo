@@ -2,20 +2,22 @@ import { Wallet } from 'ethers';
 import cron from 'node-cron';
 import {
   EthersEip712Signer,
-  getAuthMetadata,
-  getInsecureHubRpcClient,
-  HubRpcClient,
   makeCastAdd,
   makeReactionAdd,
   makeSignerAdd,
   NobleEd25519Signer,
   toFarcasterTime,
-} from '@farcaster/utils';
+  getAuthMetadata,
+  getInsecureHubRpcClient,
+  HubRpcClient,
+  FarcasterNetwork,
+  ReactionType,
+} from '@farcaster/hub-nodejs';
 import { logger } from '~/utils/logger';
 import * as ed from '@noble/ed25519';
-import { FarcasterNetwork, ReactionType } from '@farcaster/protobufs';
 import { faker } from '@faker-js/faker';
 import Server from '~/rpc/server';
+import { Result } from 'neverthrow';
 
 const log = logger.child({
   component: 'PeriodicTestDataJob',
@@ -86,8 +88,17 @@ export class PeriodicTestDataJobScheduler {
       );
       const signerAdd = signerAddResult._unsafeUnwrap();
 
-      const { user, password } = this._server.auth;
-      const result = await client.submitMessage(signerAdd, getAuthMetadata(user ?? '', password ?? ''));
+      const rpcUsers = this._server.auth;
+
+      let user = '';
+      let password = '';
+
+      if (rpcUsers.size > 0) {
+        user = rpcUsers.keys().next().value as string;
+        password = rpcUsers.get(user)?.[0] as string;
+      }
+
+      const result = await client.submitMessage(signerAdd, getAuthMetadata(user, password));
       if (result.isErr()) {
         log.error({ error: result.error, dataOptions }, 'TestData: failed to submit SignerAdd message');
       }
@@ -108,6 +119,16 @@ export class PeriodicTestDataJobScheduler {
     const farcasterTimestamp = toFarcasterTime(Date.now())._unsafeUnwrap();
     const targetCastIds = [];
 
+    const rpcUsers = this._server.auth;
+
+    let rpcUsername = '';
+    let rpcPassword = '';
+
+    if (rpcUsers.size > 0) {
+      rpcUsername = rpcUsers.keys().next().value as string;
+      rpcPassword = rpcUsers.get(rpcUsername)?.[0] as string;
+    }
+
     // Insert some casts
     for (const testUser of this._testDataUsers) {
       const dataOptions = {
@@ -124,8 +145,7 @@ export class PeriodicTestDataJobScheduler {
           signer
         );
 
-        const { user, password } = this._server.auth;
-        const result = await client.submitMessage(castAdd._unsafeUnwrap(), getAuthMetadata(user ?? '', password ?? ''));
+        const result = await client.submitMessage(castAdd._unsafeUnwrap(), getAuthMetadata(rpcUsername, rpcPassword));
         if (result.isErr()) {
           log.error({ error: result.error, dataOptions }, 'TestData: failed to submit CastAdd message');
         }
@@ -148,10 +168,9 @@ export class PeriodicTestDataJobScheduler {
           if (targetCastId.fid !== testUser.fid) {
             const reactionAdd = await makeReactionAdd({ type: ReactionType.LIKE, targetCastId }, dataOptions, signer);
 
-            const { user, password } = this._server.auth;
             const result = await client.submitMessage(
               reactionAdd._unsafeUnwrap(),
-              getAuthMetadata(user ?? '', password ?? '')
+              getAuthMetadata(rpcUsername, rpcPassword)
             );
             if (result.isErr()) {
               log.error({ error: result.error, dataOptions }, 'TestData: failed to submit ReactionAdd message');
@@ -159,6 +178,14 @@ export class PeriodicTestDataJobScheduler {
           }
         }
       }
+    }
+
+    const closeResult = Result.fromThrowable(
+      () => client.close(),
+      (e) => e as Error
+    )();
+    if (closeResult.isErr()) {
+      log.warn({ error: closeResult.error }, 'TestData: failed to close client');
     }
   }
 }

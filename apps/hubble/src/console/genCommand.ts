@@ -1,5 +1,12 @@
-import * as protobufs from '@farcaster/protobufs';
-import { AdminRpcClient, Factories, getAuthMetadata, HubRpcClient } from '@farcaster/utils';
+import {
+  AdminRpcClient,
+  Factories,
+  getAuthMetadata,
+  HubRpcClient,
+  FarcasterNetwork,
+  Message,
+  Metadata,
+} from '@farcaster/hub-nodejs';
 import { ConsoleCommandInterface } from './console';
 
 // We use console.log() in this file, so we disable the eslint rule. This is the REPL console, after all!
@@ -37,12 +44,12 @@ export class GenCommand implements ConsoleCommandInterface {
     return {
       submitMessages: async (
         numMessages = 100,
-        network = protobufs.FarcasterNetwork.DEVNET,
-        username?: string | protobufs.Metadata,
+        network = FarcasterNetwork.DEVNET,
+        username?: string | Metadata,
         password?: string
       ): Promise<string | SubmitStats> => {
         // Submit messages might need a username/password
-        let metadata = new protobufs.Metadata();
+        let metadata = new Metadata();
         if (username && typeof username !== 'string') {
           metadata = username;
         } else if (username && password) {
@@ -83,7 +90,7 @@ export class GenCommand implements ConsoleCommandInterface {
           return `Failed to submit signer add message for fid ${fid}: ${signerResult.error}`;
         }
 
-        const submitBatch = async (batch: protobufs.Message[]) => {
+        const submitBatch = async (batch: Message[]) => {
           const promises = [];
           for (const castAdd of batch) {
             promises.push(this.rpcClient.submitMessage(castAdd, metadata));
@@ -104,9 +111,11 @@ export class GenCommand implements ConsoleCommandInterface {
           return { numSuccess, numFail, errorMessage };
         };
 
-        for (let i = 0; i < numMessages; i += 100) {
+        const batchSize = 5000;
+
+        for (let i = 0; i < numMessages; i += batchSize) {
           const batch = [];
-          for (let j = i; j < i + 100 && j < numMessages; j++) {
+          for (let j = i; j < i + batchSize && j < numMessages; j++) {
             batch.push(await Factories.CastAddMessage.create({ data: { fid, network } }, { transient: { signer } }));
           }
           const result = await submitBatch(batch);

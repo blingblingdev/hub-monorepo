@@ -1,4 +1,3 @@
-import * as protobufs from '@farcaster/protobufs';
 import {
   ContactInfoContent,
   FarcasterNetwork,
@@ -8,16 +7,15 @@ import {
   IdRegistryEvent,
   Message,
   NameRegistryEvent,
-} from '@farcaster/protobufs';
-import {
+  UpdateNameRegistryEventExpiryJobPayload,
   HubAsyncResult,
   HubError,
-  HubRpcClient,
   bytesToHexString,
   bytesToUtf8String,
+  HubRpcClient,
   getSSLHubRpcClient,
   getInsecureHubRpcClient,
-} from '@farcaster/utils';
+} from '@farcaster/hub-nodejs';
 import { PeerId } from '@libp2p/interface-peer-id';
 import { peerIdFromBytes } from '@libp2p/peer-id';
 import { publicAddressesFirst } from '@libp2p/utils/address-sort';
@@ -49,20 +47,31 @@ import {
   ipFamilyToString,
   p2pMultiAddrStr,
 } from '~/utils/p2p';
-import { PeriodicTestDataJobScheduler, TestUser } from './utils/periodicTestDataJob';
+import { PeriodicTestDataJobScheduler, TestUser } from '~/utils/periodicTestDataJob';
+import { ensureAboveMinFarcasterVersion, VersionSchedule } from '~/utils/versions';
+import { CheckFarcasterVersionJobScheduler } from '~/storage/jobs/checkFarcasterVersionJob';
+import { ValidateOrRevokeMessagesJobScheduler } from '~/storage/jobs/validateOrRevokeMessagesJob';
+import { GossipContactInfoJobScheduler } from '~/storage/jobs/gossipContactInfoJob';
+import { MAINNET_ALLOWED_PEERS } from './allowedPeers.mainnet';
 
 export type HubSubmitSource = 'gossip' | 'rpc' | 'eth-provider';
 
 export const APP_VERSION = process.env['npm_package_version'] ?? '1.0.0';
 export const APP_NICKNAME = process.env['HUBBLE_NAME'] ?? 'Farcaster Hub';
 
+export const FARCASTER_VERSION = '2023.3.1';
+export const FARCASTER_VERSIONS_SCHEDULE: VersionSchedule[] = [
+  { version: '2023.3.1', expiresAt: 1682553600000 }, // expires at 4/27/23 00:00 UTC
+];
+
 export interface HubInterface {
   engine: Engine;
-  submitMessage(message: protobufs.Message, source?: HubSubmitSource): HubAsyncResult<number>;
-  submitIdRegistryEvent(event: protobufs.IdRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number>;
-  submitNameRegistryEvent(event: protobufs.NameRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number>;
-  getHubState(): HubAsyncResult<protobufs.HubState>;
-  putHubState(hubState: protobufs.HubState): HubAsyncResult<void>;
+  submitMessage(message: Message, source?: HubSubmitSource): HubAsyncResult<number>;
+  submitIdRegistryEvent(event: IdRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number>;
+  submitNameRegistryEvent(event: NameRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number>;
+  getHubState(): HubAsyncResult<HubState>;
+  putHubState(hubState: HubState): HubAsyncResult<void>;
+  gossipContactInfo(): HubAsyncResult<void>;
 }
 
 export interface HubOptions {
@@ -78,8 +87,11 @@ export interface HubOptions {
   /** A list of PeerId strings to allow connections with */
   allowedPeers?: string[];
 
-  /** IP address string in MultiAddr format to bind to */
+  /** IP address string in MultiAddr format to bind the gossip node to */
   ipMultiAddr?: string;
+
+  /** IP address string to bind the RPC server to */
+  rpcServerHost?: string;
 
   /** External IP address to announce to peers. If not provided, it'll fetch the IP from an external service */
   announceIp?: string;
@@ -168,6 +180,9 @@ export class Hub implements HubInterface {
   private periodSyncJobScheduler: PeriodicSyncJobScheduler;
   private pruneEventsJobScheduler: PruneEventsJobScheduler;
   private testDataJobScheduler?: PeriodicTestDataJobScheduler;
+  private checkFarcasterVersionJobScheduler: CheckFarcasterVersionJobScheduler;
+  private validateOrRevokeMessagesJobScheduler: ValidateOrRevokeMessagesJobScheduler;
+  private gossipContactInfoJobScheduler: GossipContactInfoJobScheduler;
 
   private updateNameRegistryEventExpiryJobQueue: UpdateNameRegistryEventExpiryJobQueue;
   private updateNameRegistryEventExpiryJobWorker?: UpdateNameRegistryEventExpiryJobWorker;
@@ -179,19 +194,6 @@ export class Hub implements HubInterface {
     this.options = options;
     this.rocksDB = new RocksDB(options.rocksDBName ? options.rocksDBName : randomDbName());
     this.gossipNode = new GossipNode();
-
-    this.engine = new Engine(this.rocksDB, options.network);
-    this.syncEngine = new SyncEngine(this.engine, this.rocksDB);
-
-    this.rpcServer = new Server(
-      this,
-      this.engine,
-      this.syncEngine,
-      this.gossipNode,
-      options.rpcAuth,
-      options.rpcRateLimit
-    );
-    this.adminServer = new AdminServer(this, this.rocksDB, this.engine, this.syncEngine, options.rpcAuth);
 
     // Create the ETH registry provider, which will fetch ETH events and push them into the engine.
     // Defaults to Goerli testnet, which is currently used for Production Farcaster Hubs.
@@ -208,6 +210,19 @@ export class Hub implements HubInterface {
       log.warn('No ETH RPC URL provided, not syncing with ETH contract events');
     }
 
+    this.engine = new Engine(this.rocksDB, options.network);
+    this.syncEngine = new SyncEngine(this.engine, this.rocksDB, this.ethRegistryProvider);
+
+    this.rpcServer = new Server(
+      this,
+      this.engine,
+      this.syncEngine,
+      this.gossipNode,
+      options.rpcAuth,
+      options.rpcRateLimit
+    );
+    this.adminServer = new AdminServer(this, this.rocksDB, this.engine, this.syncEngine, options.rpcAuth);
+
     // Setup job queues
     this.updateNameRegistryEventExpiryJobQueue = new UpdateNameRegistryEventExpiryJobQueue(this.rocksDB);
 
@@ -215,6 +230,9 @@ export class Hub implements HubInterface {
     this.pruneMessagesJobScheduler = new PruneMessagesJobScheduler(this.engine);
     this.periodSyncJobScheduler = new PeriodicSyncJobScheduler(this, this.syncEngine);
     this.pruneEventsJobScheduler = new PruneEventsJobScheduler(this.engine);
+    this.checkFarcasterVersionJobScheduler = new CheckFarcasterVersionJobScheduler(this);
+    this.validateOrRevokeMessagesJobScheduler = new ValidateOrRevokeMessagesJobScheduler(this.rocksDB, this.engine);
+    this.gossipContactInfoJobScheduler = new GossipContactInfoJobScheduler(this);
 
     if (options.testUsers) {
       this.testDataJobScheduler = new PeriodicTestDataJobScheduler(this.rpcServer, options.testUsers as TestUser[]);
@@ -298,7 +316,27 @@ export class Hub implements HubInterface {
       }
     }
 
+    // Get the Network ID from the DB
+    const dbNetworkResult = await this.getDbNetwork();
+    if (dbNetworkResult.isOk() && dbNetworkResult.value && dbNetworkResult.value !== this.options.network) {
+      throw new HubError(
+        'unavailable',
+        `network mismatch: DB is ${dbNetworkResult.value}, but Hub is started with ${this.options.network}. ` +
+          `Please reset the DB with the "dbreset" command if this is intentional.`
+      );
+    }
+
+    // Set the network in the DB
+    await this.setDbNetwork(this.options.network);
+    log.info(`starting hub with Farcaster version ${FARCASTER_VERSION} and network ${this.options.network}`);
+
     await this.engine.start();
+
+    // Start the RPC server
+    await this.rpcServer.start(this.options.rpcServerHost, this.options.rpcPort ? this.options.rpcPort : 0);
+    if (this.options.adminServerEnabled) {
+      await this.adminServer.start(this.options.adminServerHost ?? '127.0.0.1');
+    }
 
     // Start the ETH registry provider first
     if (this.ethRegistryProvider) {
@@ -312,25 +350,29 @@ export class Hub implements HubInterface {
       this.updateNameRegistryEventExpiryJobWorker.start();
     }
 
+    let allowedPeerIdStrs = this.options.allowedPeers;
+    if (this.options.network === FarcasterNetwork.MAINNET) {
+      // Mainnet is right now resitrcited to a few peers
+      // Append and de-dup the allowed peers
+      allowedPeerIdStrs = [...new Set([...(allowedPeerIdStrs ?? []), ...MAINNET_ALLOWED_PEERS])];
+    }
+
     await this.gossipNode.start(this.options.bootstrapAddrs ?? [], {
       peerId: this.options.peerId,
       ipMultiAddr: this.options.ipMultiAddr,
       announceIp: this.options.announceIp,
       gossipPort: this.options.gossipPort,
-      allowedPeerIdStrs: this.options.allowedPeers,
+      allowedPeerIdStrs,
     });
 
-    // Start the RPC server
-    await this.rpcServer.start(this.options.rpcPort ? this.options.rpcPort : 0);
-    if (this.options.adminServerEnabled) {
-      await this.adminServer.start(this.options.adminServerHost ?? '127.0.0.1');
-    }
     this.registerEventHandlers();
 
     // Start cron tasks
     this.pruneMessagesJobScheduler.start(this.options.pruneMessagesJobCron);
     this.periodSyncJobScheduler.start();
     this.pruneEventsJobScheduler.start(this.options.pruneEventsJobCron);
+    this.checkFarcasterVersionJobScheduler.start();
+    this.validateOrRevokeMessagesJobScheduler.start();
 
     // Start the test data generator
     this.testDataJobScheduler?.start();
@@ -363,6 +405,8 @@ export class Hub implements HubInterface {
         rpcAddress: rpcAddressContactInfo,
         excludedHashes: snapshot.excludedHashes,
         count: snapshot.numMessages,
+        hubVersion: FARCASTER_VERSION,
+        network: this.options.network,
       });
     });
   }
@@ -386,6 +430,10 @@ export class Hub implements HubInterface {
     this.pruneMessagesJobScheduler.stop();
     this.periodSyncJobScheduler.stop();
     this.pruneEventsJobScheduler.stop();
+    this.checkFarcasterVersionJobScheduler.stop();
+    this.testDataJobScheduler?.stop();
+    this.updateNameRegistryEventExpiryJobWorker?.stop();
+    this.validateOrRevokeMessagesJobScheduler.stop();
 
     // Stop the ETH registry provider
     if (this.ethRegistryProvider) {
@@ -413,6 +461,23 @@ export class Hub implements HubInterface {
 
   async connectAddress(address: Multiaddr): HubAsyncResult<void> {
     return this.gossipNode.connectAddress(address);
+  }
+
+  async gossipContactInfo(): HubAsyncResult<void> {
+    const contactInfoResult = await this.getContactInfoContent();
+    if (contactInfoResult.isErr()) {
+      log.warn(contactInfoResult.error, 'failed get contact info content');
+      return Promise.resolve(err(contactInfoResult.error));
+    } else {
+      const contactInfo = contactInfoResult.value;
+      log.info(
+        { rpcAddress: contactInfo.rpcAddress?.address, rpcPort: contactInfo.rpcAddress?.port },
+        'gossiping contact info'
+      );
+
+      await this.gossipNode.gossipContactInfo(contactInfo);
+      return Promise.resolve(ok(undefined));
+    }
   }
 
   /** ------------------------------------------------------------------------- */
@@ -454,7 +519,7 @@ export class Hub implements HubInterface {
     }
   }
 
-  private async handleContactInfo(peerId: PeerId, message: ContactInfoContent) {
+  private async handleContactInfo(peerId: PeerId, message: ContactInfoContent): Promise<void> {
     // Updates the address book for this peer
     const gossipAddress = message.gossipAddress;
     if (gossipAddress) {
@@ -465,23 +530,43 @@ export class Hub implements HubInterface {
       }
 
       const p2pMultiAddrResult = p2pMultiAddrStr(addressInfo.value, peerId.toString()).map((addr: string) =>
-        multiaddr(addr)
+        Result.fromThrowable(
+          () => multiaddr(addr),
+          (error) => new HubError('bad_request.parse_failure', error as Error)
+        )()
       );
 
-      const res = Result.combine([p2pMultiAddrResult]).map(async ([multiaddr]) => {
-        if (!this.gossipNode.addressBook) {
-          return err(new HubError('unavailable', 'address book missing for gossipNode'));
-        }
-
-        return await ResultAsync.fromPromise(
-          this.gossipNode.addressBook.add(peerId, [multiaddr]),
-          (error) => new HubError('unavailable', error as Error)
-        ).map(() => ok(undefined));
-      });
-
-      if (res.isErr()) {
-        log.error({ error: res.error, message }, 'failed to add contact info to address book');
+      if (p2pMultiAddrResult.isErr()) {
+        log.error(
+          { error: p2pMultiAddrResult.error, message, address: addressInfo.value },
+          'failed to create multiaddr'
+        );
+        return;
       }
+
+      if (p2pMultiAddrResult.value.isErr()) {
+        log.error(
+          { error: p2pMultiAddrResult.value.error, message, address: addressInfo.value },
+          'failed to parse multiaddr'
+        );
+        return;
+      }
+
+      // Ignore peers that are below the minimum supported version.
+      const theirVersion = message.hubVersion;
+      const versionCheckResult = ensureAboveMinFarcasterVersion(theirVersion);
+      if (versionCheckResult.isErr() || message.network !== this.options.network) {
+        log.warn(
+          { peerId, theirVersion, theirNetwork: message.network },
+          'Peer is running an invalid or outdated version, ignoring'
+        );
+        await this.gossipNode.removePeerFromAddressBook(peerId);
+        this.syncEngine.removeContactInfoForPeerId(peerId.toString());
+        return;
+      }
+
+      const multiaddrValue = p2pMultiAddrResult.value.value;
+      await this.gossipNode.addPeerToAddressBook(peerId, multiaddrValue);
     }
 
     log.info({ identity: this.identity, peer: peerId, message }, 'received a Contact Info for sync');
@@ -580,6 +665,8 @@ export class Hub implements HubInterface {
       return await this.getHubRpcClient(addressInfoToString(ai));
     } catch (e) {
       log.error({ error: e, peer, peerId, addressInfo: ai }, 'unable to connect to peer');
+      // If the peer is unreachable (e.g. behind a firewall), remove it from our address book
+      await this.gossipNode.removePeerFromAddressBook(peerId);
       return undefined;
     }
   }
@@ -604,17 +691,7 @@ export class Hub implements HubInterface {
       // When we connect to a new node, gossip out our contact info 1 second later.
       // The setTimeout is to ensure that we have a chance to receive the peer's info properly.
       setTimeout(async () => {
-        (await this.getContactInfoContent())
-          .map(async (contactInfo) => {
-            log.info(
-              { rpcAddress: contactInfo.rpcAddress?.address, rpcPort: contactInfo.rpcAddress?.port },
-              'gossiping contact info'
-            );
-            await this.gossipNode.gossipContactInfo(contactInfo);
-          })
-          .mapErr((error) => {
-            log.warn(error, 'failed get contact info content');
-          });
+        await this.gossipContactInfo();
       }, 1 * 1000);
     });
 
@@ -695,7 +772,7 @@ export class Hub implements HubInterface {
     );
 
     if (!event.expiry) {
-      const payload = protobufs.UpdateNameRegistryEventExpiryJobPayload.create({ fname: event.fname });
+      const payload = UpdateNameRegistryEventExpiryJobPayload.create({ fname: event.fname });
       await this.updateNameRegistryEventExpiryJobQueue.enqueueJob(payload);
     }
 
@@ -715,6 +792,37 @@ export class Hub implements HubInterface {
       this.rocksDB.get(Buffer.from([RootPrefix.HubCleanShutdown])),
       (e) => e as HubError
     ).map((value) => value?.[0] === 1);
+  }
+
+  async getDbNetwork(): HubAsyncResult<FarcasterNetwork | undefined> {
+    const dbResult = await ResultAsync.fromPromise(
+      this.rocksDB.get(Buffer.from([RootPrefix.Network])),
+      (e) => e as HubError
+    );
+    if (dbResult.isErr()) {
+      return err(dbResult.error);
+    }
+
+    // parse the buffer as an int
+    const networkNumber = Result.fromThrowable(
+      () => dbResult.value.readUInt32BE(0),
+      (e) => e as HubError
+    )();
+    if (networkNumber.isErr()) {
+      return err(networkNumber.error);
+    }
+
+    // get the enum value from the number
+    return networkNumber.map((n) => n as FarcasterNetwork);
+  }
+
+  async setDbNetwork(network: FarcasterNetwork): HubAsyncResult<void> {
+    const txn = this.rocksDB.transaction();
+    const value = Buffer.alloc(4);
+    value.writeUInt32BE(network, 0);
+    txn.put(Buffer.from([RootPrefix.Network]), value);
+
+    return ResultAsync.fromPromise(this.rocksDB.commit(txn), (e) => e as HubError);
   }
 
   /* -------------------------------------------------------------------------- */
