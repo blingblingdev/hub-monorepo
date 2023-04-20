@@ -288,7 +288,7 @@ export default class Server {
       getAllMessagesBySyncIds: async (call, callback) => {
         const request = call.request;
 
-        const messagesResult = await this.engine?.getAllMessagesBySyncIds(request.syncIds);
+        const messagesResult = await this.syncEngine?.getAllMessagesBySyncIds(request.syncIds);
         messagesResult?.match(
           (messages) => {
             // Check the messages for corruption. If a message is blank, that means it was present
@@ -406,11 +406,6 @@ export default class Server {
         const result = await this.hub?.submitMessage(message, 'rpc');
         result?.match(
           () => {
-            if (this.gossipNode) {
-              // When submitting a message via RPC, we want to gossip it to other nodes.
-              // This is a promise, but we won't await it.
-              this.gossipNode.gossipMessage(message);
-            }
             callback(null, message);
           },
           (err: HubError) => {
@@ -449,9 +444,13 @@ export default class Server {
         );
       },
       getCastsByParent: async (call, callback) => {
-        const { castId, pageSize, pageToken, reverse } = call.request;
+        const { parentCastId, parentUrl, pageSize, pageToken, reverse } = call.request;
 
-        const castsResult = await this.engine?.getCastsByParent(castId as CastId, { pageSize, pageToken, reverse });
+        const castsResult = await this.engine?.getCastsByParent(parentCastId ?? parentUrl ?? '', {
+          pageSize,
+          pageToken,
+          reverse,
+        });
         castsResult?.match(
           (page: MessagesPage<CastAddMessage>) => {
             callback(null, messagesPageToResponse(page));
@@ -480,7 +479,7 @@ export default class Server {
         const reactionResult = await this.engine?.getReaction(
           request.fid,
           request.reactionType,
-          request.castId ?? CastId.create()
+          request.targetCastId ?? request.targetUrl ?? ''
         );
         reactionResult?.match(
           (reaction: ReactionAddMessage) => {
@@ -508,8 +507,24 @@ export default class Server {
         );
       },
       getReactionsByCast: async (call, callback) => {
-        const { castId, reactionType, pageSize, pageToken, reverse } = call.request;
-        const reactionsResult = await this.engine?.getReactionsByCast(castId ?? CastId.create(), reactionType, {
+        const { targetCastId, reactionType, pageSize, pageToken, reverse } = call.request;
+        const reactionsResult = await this.engine?.getReactionsByTarget(targetCastId ?? CastId.create(), reactionType, {
+          pageSize,
+          pageToken,
+          reverse,
+        });
+        reactionsResult?.match(
+          (page: MessagesPage<ReactionAddMessage>) => {
+            callback(null, messagesPageToResponse(page));
+          },
+          (err: HubError) => {
+            callback(toServiceError(err));
+          }
+        );
+      },
+      getReactionsByTarget: async (call, callback) => {
+        const { targetCastId, targetUrl, reactionType, pageSize, pageToken, reverse } = call.request;
+        const reactionsResult = await this.engine?.getReactionsByTarget(targetCastId ?? targetUrl ?? '', reactionType, {
           pageSize,
           pageToken,
           reverse,

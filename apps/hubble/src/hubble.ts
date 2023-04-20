@@ -54,14 +54,15 @@ import { GossipContactInfoJobScheduler } from '~/storage/jobs/gossipContactInfoJ
 import { MAINNET_ALLOWED_PEERS } from './allowedPeers.mainnet';
 import StoreEventHandler from '~/storage/stores/storeEventHandler';
 
-export type HubSubmitSource = 'gossip' | 'rpc' | 'eth-provider';
+export type HubSubmitSource = 'gossip' | 'rpc' | 'eth-provider' | 'sync';
 
 export const APP_VERSION = process.env['npm_package_version'] ?? '1.0.0';
 export const APP_NICKNAME = process.env['HUBBLE_NAME'] ?? 'Farcaster Hub';
 
-export const FARCASTER_VERSION = '2023.3.1';
+export const FARCASTER_VERSION = '2023.4.19';
 export const FARCASTER_VERSIONS_SCHEDULE: VersionSchedule[] = [
   { version: '2023.3.1', expiresAt: 1682553600000 }, // expires at 4/27/23 00:00 UTC
+  { version: '2023.4.19', expiresAt: 1686700800000 }, // expires at 6/14/23 00:00 UTC
 ];
 
 export interface HubInterface {
@@ -221,7 +222,7 @@ export class Hub implements HubInterface {
       lockTimeout: options.commitLockTimeout,
     });
     this.engine = new Engine(this.rocksDB, options.network, eventHandler);
-    this.syncEngine = new SyncEngine(this.engine, this.rocksDB, this.ethRegistryProvider);
+    this.syncEngine = new SyncEngine(this, this.rocksDB, this.ethRegistryProvider);
 
     this.rpcServer = new Server(
       this,
@@ -732,6 +733,11 @@ export class Hub implements HubInterface {
       }
     );
 
+    // When submitting a message via RPC, we want to gossip it to other nodes
+    if (mergeResult.isOk() && source === 'rpc') {
+      void this.gossipNode.gossipMessage(message);
+    }
+
     return mergeResult;
   }
 
@@ -827,6 +833,7 @@ export class Hub implements HubInterface {
 
     return ResultAsync.fromPromise(this.rocksDB.commit(txn), (e) => e as HubError);
   }
+
   async isValidPeer(ourPeerId: PeerId, message: ContactInfoContent) {
     const theirVersion = message.hubVersion;
     const theirNetwork = message.network;
@@ -849,13 +856,5 @@ export class Hub implements HubInterface {
     }
 
     return true;
-  }
-
-  /* -------------------------------------------------------------------------- */
-  /*                                  Test API                                  */
-  /* -------------------------------------------------------------------------- */
-
-  async destroyDB() {
-    await this.rocksDB.destroy();
   }
 }
