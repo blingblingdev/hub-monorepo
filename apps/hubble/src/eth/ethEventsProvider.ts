@@ -48,12 +48,14 @@ export class EthEventsProvider {
   private _nameRegistryContract: Contract;
   private _firstBlock: number;
   private _chunkSize: number;
+  private _resyncEvents: boolean;
 
   private _numConfirmations: number;
 
   private _idEventsByBlock: Map<number, Array<IdRegistryEvent>>;
   private _nameEventsByBlock: Map<number, Array<NameRegistryEvent>>;
   private _renewEventsByBlock: Map<number, Array<NameRegistryRenewEvent>>;
+  private _retryDedupMap: Map<number, boolean>;
 
   private _lastBlockNumber: number;
 
@@ -66,7 +68,8 @@ export class EthEventsProvider {
     idRegistryContract: Contract,
     nameRegistryContract: Contract,
     firstBlock: number,
-    chunkSize: number
+    chunkSize: number,
+    resyncEvents: boolean
   ) {
     this._hub = hub;
     this._jsonRpcProvider = jsonRpcProvider;
@@ -74,6 +77,7 @@ export class EthEventsProvider {
     this._nameRegistryContract = nameRegistryContract;
     this._firstBlock = firstBlock;
     this._chunkSize = chunkSize;
+    this._resyncEvents = resyncEvents;
 
     // Number of blocks to wait before processing an event.
     // This is hardcoded to 6 for now, because that's the threshold beyond which blocks are unlikely to reorg anymore.
@@ -87,6 +91,7 @@ export class EthEventsProvider {
     this._nameEventsByBlock = new Map();
     this._idEventsByBlock = new Map();
     this._renewEventsByBlock = new Map();
+    this._retryDedupMap = new Map();
 
     // Setup IdRegistry contract
     this._idRegistryContract.on('Register', (to: string, id: bigint, _recovery, _url, event: ContractEventPayload) => {
@@ -122,7 +127,8 @@ export class EthEventsProvider {
     idRegistryAddress: string,
     nameRegistryAddress: string,
     firstBlock: number,
-    chunkSize: number
+    chunkSize: number,
+    resyncEvents: boolean
   ): EthEventsProvider {
     // Setup provider and the contracts
     const jsonRpcProvider = new JsonRpcProvider(ethRpcUrl);
@@ -136,7 +142,8 @@ export class EthEventsProvider {
       idRegistryContract,
       nameRegistryContract,
       firstBlock,
-      chunkSize
+      chunkSize,
+      resyncEvents
     );
 
     return provider;
@@ -213,6 +220,11 @@ export class EthEventsProvider {
       lastSyncedBlock = hubState.value.lastEthBlock;
     }
 
+    if (this._resyncEvents) {
+      log.info(`Resyncing events from ${this._firstBlock} instead of ${lastSyncedBlock}`);
+      lastSyncedBlock = this._firstBlock;
+    }
+
     log.info({ lastSyncedBlock }, 'last synced block');
     const toBlock = latestBlock.number;
 
@@ -235,11 +247,15 @@ export class EthEventsProvider {
    * @param blockNumber
    */
   public async retryEventsFromBlock(blockNumber: number) {
-    await this.syncHistoricalIdEvents(IdRegistryEventType.REGISTER, blockNumber, blockNumber, this._chunkSize);
-    await this.syncHistoricalIdEvents(IdRegistryEventType.TRANSFER, blockNumber, blockNumber, this._chunkSize);
+    if (this._retryDedupMap.has(blockNumber)) {
+      return;
+    }
+    this._retryDedupMap.set(blockNumber, true);
+    await this.syncHistoricalIdEvents(IdRegistryEventType.REGISTER, blockNumber, blockNumber + 1, 1);
+    await this.syncHistoricalIdEvents(IdRegistryEventType.TRANSFER, blockNumber, blockNumber + 1, 1);
 
     // Sync old Name Transfer events
-    await this.syncHistoricalNameEvents(NameRegistryEventType.TRANSFER, blockNumber, blockNumber, this._chunkSize);
+    await this.syncHistoricalNameEvents(NameRegistryEventType.TRANSFER, blockNumber, blockNumber + 1, 1);
   }
 
   /**
@@ -466,6 +482,8 @@ export class EthEventsProvider {
             await this._hub.submitNameRegistryEvent(updatedEvent);
           }
         }
+
+        this._retryDedupMap.delete(cachedBlock);
       }
     }
 

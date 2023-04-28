@@ -51,7 +51,8 @@ app
   .option('--first-block <number>', 'The block number to begin syncing events from Farcaster contracts')
   .option(
     '--chunk-size <number>',
-    'The number of blocks to batch when syncing historical events from Farcaster contracts. (default: 10000)'
+    'The number of blocks to batch when syncing historical events from Farcaster contracts. (default: 10000)',
+    parseNumber
   )
   .option('-b, --bootstrap <peer-multiaddrs...>', 'A list of peer multiaddrs to bootstrap libp2p')
   .option('-a, --allowed-peers <peerIds...>', 'An allow-list of peer ids permitted to connect to the hub')
@@ -78,6 +79,7 @@ app
   .option('--admin-server-host <host>', "The host the admin server should listen on. (default: '127.0.0.1')")
   .option('--db-name <name>', 'The name of the RocksDB instance')
   .option('--rebuild-sync-trie', 'Rebuilds the sync trie before starting')
+  .option('--resync-eth-events', 'Resyncs events from the Farcaster contracts before starting')
   .option('--commit-lock-timeout <number>', 'Commit lock timeout in milliseconds (default: 500)', parseNumber)
   .option('--commit-lock-max-pending <number>', 'Commit lock max pending jobs (default: 1000)', parseNumber)
   .option('-i, --id <filepath>', 'Path to the PeerId file')
@@ -293,6 +295,7 @@ app
       rocksDBName: cliOptions.dbName ?? hubConfig.dbName,
       resetDB,
       rebuildSyncTrie,
+      resyncEthEvents: cliOptions.resyncEthEvents ?? hubConfig.resyncEthEvents ?? false,
       commitLockTimeout: cliOptions.commitLockTimeout ?? hubConfig.commitLockTimeout,
       commitLockMaxPending: cliOptions.commitLockMaxPending ?? hubConfig.commitLockMaxPending,
       adminServerEnabled: cliOptions.adminServerEnabled ?? hubConfig.adminServerEnabled,
