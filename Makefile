@@ -5,7 +5,7 @@ IMAGE_TAG="ccr.ccs.tencentyun.com/lolita/farcaster-hubble:$(BRANCH)-$(HEAD)"
 .PHONY: image
 # build and push image
 image:
-	docker build . -t $(IMAGE_TAG) && docker push $(IMAGE_TAG)
+	docker build -f Dockerfile.hubble.test . -t $(IMAGE_TAG) && docker push $(IMAGE_TAG)
 
 # show help
 help:
