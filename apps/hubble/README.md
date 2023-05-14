@@ -4,7 +4,7 @@ Hubble is a Typescript implementation of a [Farcaster Hub](https://github.com/fa
 
 A Hub will download an entire copy of the network to your machine and keep it in sync. Messages can be created and uploaded to a Hub and they will propagate to all other Hubs. Running a Hub gives you a private instance that you can query as much as you like and helps decentralized the network.
 
-If you already have the URL of a publicly hosted Hub, just follow instructions on [interacting with Hubs](#🔨-interacting-with-hubble).
+If you already have the URL of a publicly hosted Hub, just follow instructions on [interacting with Hubs](#hammer-interacting-with-hubble).
 
 ## :computer: Getting Started Locally
 
@@ -31,6 +31,11 @@ Hubble will sync with the on-chain contracts, and issue thousands of messages li
 0 | hubble | { level: 30, time: 1679703063660, pid: 3259, hostname: 'ip-10-0-0-85', component: 'EthEventsProvider', blockNumber: 8712752, msg: 'new block: 8712752 };
 
 0 | hubble | { level: 30, time: 1679702496763, pid: 3259, hostname: 'ip-10-0-0-85', component: 'SyncEngine', total: 1, success: 1, msg: 'Merged messages', };
+```
+
+You can monitor the status of the sync with:
+```
+yarn status --watch # Might need to pass in --insecure if you don't have TLS configured
 ```
 
 ### 4. Switch to Mainnet
@@ -88,6 +93,11 @@ Hubble will sync with the on-chain contracts, and issue thousands of messages li
 0 | hubble | { level: 30, time: 1679703063660, pid: 3259, hostname: 'ip-10-0-0-85', component: 'EthEventsProvider', blockNumber: 8712752, msg: 'new block: 8712752 };
 
 0 | hubble | { level: 30, time: 1679702496763, pid: 3259, hostname: 'ip-10-0-0-85', component: 'SyncEngine', total: 1, success: 1, msg: 'Merged messages', };
+```
+
+You can monitor the status of the sync with:
+```
+yarn status --watch # Might need to pass in --insecure if you don't have TLS configured
 ```
 
 ### 5. Switch to Mainnet

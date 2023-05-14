@@ -65,6 +65,10 @@ beforeAll(async () => {
   );
 });
 
+beforeEach(async () => {
+  await eventHandler.syncCache();
+});
+
 describe('getIdRegistryEvent', () => {
   test('returns contract event if it exists', async () => {
     await set.mergeIdRegistryEvent(custody1Event);
@@ -1009,6 +1013,7 @@ describe('pruneMessages', () => {
   let add3: SignerAddMessage;
   let add4: SignerAddMessage;
   let add5: SignerAddMessage;
+  let addOld1: SignerAddMessage;
 
   let remove1: SignerRemoveMessage;
   let remove2: SignerRemoveMessage;
@@ -1039,16 +1044,13 @@ describe('pruneMessages', () => {
     add3 = await generateAddWithTimestamp(fid, time + 3);
     add4 = await generateAddWithTimestamp(fid, time + 4);
     add5 = await generateAddWithTimestamp(fid, time + 5);
+    addOld1 = await generateAddWithTimestamp(fid, time - 60 * 60);
 
     remove1 = await generateRemoveWithTimestamp(fid, time + 1, add1.data.signerAddBody.signer);
     remove2 = await generateRemoveWithTimestamp(fid, time + 2, add2.data.signerAddBody.signer);
     remove3 = await generateRemoveWithTimestamp(fid, time + 3, add3.data.signerAddBody.signer);
     remove4 = await generateRemoveWithTimestamp(fid, time + 4, add4.data.signerAddBody.signer);
     remove5 = await generateRemoveWithTimestamp(fid, time + 5, add5.data.signerAddBody.signer);
-  });
-
-  beforeEach(async () => {
-    await eventHandler.syncCache();
   });
 
   describe('with size limit', () => {
@@ -1117,6 +1119,18 @@ describe('pruneMessages', () => {
       expect(result.isOk()).toBeTruthy();
 
       expect(prunedMessages).toEqual([]);
+    });
+
+    test('fails to add messages older than the earliest message', async () => {
+      const messages = [add1, add2, add3];
+      for (const message of messages) {
+        await sizePrunedStore.merge(message);
+      }
+
+      // Older messages are rejected
+      await expect(sizePrunedStore.merge(addOld1)).rejects.toEqual(
+        new HubError('bad_request.prunable', 'message would be pruned')
+      );
     });
   });
 });

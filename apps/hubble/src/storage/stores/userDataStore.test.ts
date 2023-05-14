@@ -34,6 +34,10 @@ beforeAll(async () => {
   });
 });
 
+beforeEach(async () => {
+  await eventHandler.syncCache();
+});
+
 describe('getUserDataAdd', () => {
   test('fails if missing', async () => {
     await expect(set.getUserDataAdd(fid, UserDataType.PFP)).rejects.toThrow(HubError);
@@ -275,6 +279,7 @@ describe('pruneMessages', () => {
   let add2: UserDataAddMessage;
   let add3: UserDataAddMessage;
   let add4: UserDataAddMessage;
+  let addOld1: UserDataAddMessage;
 
   const generateAddWithTimestamp = async (
     fid: number,
@@ -290,10 +295,7 @@ describe('pruneMessages', () => {
     add2 = await generateAddWithTimestamp(fid, time + 2, UserDataType.DISPLAY);
     add3 = await generateAddWithTimestamp(fid, time + 3, UserDataType.BIO);
     add4 = await generateAddWithTimestamp(fid, time + 5, UserDataType.URL);
-  });
-
-  beforeEach(async () => {
-    await eventHandler.syncCache();
+    addOld1 = await generateAddWithTimestamp(fid, time - 60 * 60, UserDataType.URL);
   });
 
   describe('with size limit', () => {
@@ -320,6 +322,18 @@ describe('pruneMessages', () => {
         const getAdd = () => sizePrunedStore.getUserDataAdd(fid, message.data.userDataBody.type);
         await expect(getAdd()).rejects.toThrow(HubError);
       }
+    });
+
+    test('fails to add messages older than the earliest message', async () => {
+      const messages = [add1, add2, add3];
+      for (const message of messages) {
+        await sizePrunedStore.merge(message);
+      }
+
+      // Older messages are rejected
+      await expect(sizePrunedStore.merge(addOld1)).rejects.toEqual(
+        new HubError('bad_request.prunable', 'message would be pruned')
+      );
     });
   });
 });

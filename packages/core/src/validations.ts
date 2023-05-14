@@ -1,8 +1,9 @@
 import * as protobufs from './protobufs';
 import { blake3 } from '@noble/hashes/blake3';
+import { ed25519 } from '@noble/curves/ed25519';
 import { err, ok, Result } from 'neverthrow';
 import { bytesCompare, bytesToUtf8String, utf8StringToBytes } from './bytes';
-import { ed25519, eip712 } from './crypto';
+import { eip712 } from './crypto';
 import { HubAsyncResult, HubError, HubResult } from './errors';
 import { getFarcasterTime } from './time';
 import { makeVerificationEthAddressClaim } from './verifications';
@@ -142,8 +143,8 @@ export const validateMessage = async (message: protobufs.Message): HubAsyncResul
       return err(new HubError('bad_request.validation_failure', 'signature does not match signer'));
     }
   } else if (message.signatureScheme === protobufs.SignatureScheme.ED25519 && !eip712SignerRequired) {
-    const signatureIsValid = await ed25519.verifyMessageHashSignature(signature, hash, signer);
-    if (signatureIsValid.isErr() || (signatureIsValid.isOk() && !signatureIsValid.value)) {
+    const signatureIsValid = ed25519.verify(signature, hash, signer);
+    if (!signatureIsValid) {
       return err(new HubError('bad_request.validation_failure', 'invalid signature'));
     }
   } else {
@@ -384,10 +385,15 @@ export const validateCastAddBody = (
     }
   }
 
-  if (body.parentCastId) {
-    const validateParent = validateCastId(body.parentCastId);
-    if (validateParent.isErr()) {
-      return err(validateParent.error);
+  if (body.parentCastId !== undefined && body.parentUrl !== undefined) {
+    return err(new HubError('bad_request.validation_failure', 'cannot use both parentUrl and parentCastId'));
+  }
+
+  const parent = body.parentCastId ?? body.parentUrl;
+  if (parent !== undefined) {
+    const validParent = validateParent(parent);
+    if (validParent.isErr()) {
+      return err(validParent.error);
     }
   }
 
@@ -434,6 +440,10 @@ export const validateReactionBody = (body: protobufs.ReactionBody): HubResult<pr
   const validatedType = validateReactionType(body.type);
   if (validatedType.isErr()) {
     return err(validatedType.error);
+  }
+
+  if (body.targetCastId !== undefined && body.targetUrl !== undefined) {
+    return err(new HubError('bad_request.validation_failure', 'cannot use both targetUrl and targetCastId'));
   }
 
   const target = body.targetCastId ?? body.targetUrl;

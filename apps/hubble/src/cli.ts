@@ -1,5 +1,11 @@
 #!/usr/bin/env node
-import { FarcasterNetwork } from '@farcaster/hub-nodejs';
+import {
+  FarcasterNetwork,
+  getInsecureHubRpcClient,
+  getSSLHubRpcClient,
+  HubInfoRequest,
+  SyncStatusRequest,
+} from '@farcaster/hub-nodejs';
 import { PeerId } from '@libp2p/interface-peer-id';
 import { createEd25519PeerId, createFromProtobuf, exportToProtobuf } from '@libp2p/peer-id-factory';
 import { Command } from 'commander';
@@ -14,6 +20,7 @@ import { addressInfoFromParts, ipMultiAddrStrFromAddressInfo, parseAddress } fro
 import { DEFAULT_RPC_CONSOLE, startConsole } from './console/console';
 import RocksDB, { DB_DIRECTORY } from './storage/db/rocksdb';
 import { parseNetwork } from './utils/command';
+import { sleep } from '~/utils/crypto';
 
 /** A CLI to accept options from the user and start the Hub */
 
@@ -48,7 +55,7 @@ app
   .option('-c, --config <filepath>', 'Path to a config file with options', DEFAULT_CONFIG_FILE)
   .option('--fir-address <address>', 'The address of the Farcaster ID Registry contract')
   .option('--fnr-address <address>', 'The address of the Farcaster Name Registry contract')
-  .option('--first-block <number>', 'The block number to begin syncing events from Farcaster contracts')
+  .option('--first-block <number>', 'The block number to begin syncing events from Farcaster contracts', parseNumber)
   .option(
     '--chunk-size <number>',
     'The number of blocks to batch when syncing historical events from Farcaster contracts. (default: 10000)',
@@ -436,6 +443,78 @@ app
   .description('Create or verify a peerID')
   .addCommand(createIdCommand)
   .addCommand(verifyIdCommand);
+
+app
+  .command('status')
+  .description('Reports the db and sync status of the hub')
+  .option(
+    '-s, --server <url>',
+    'Farcaster RPC server address:port to connect to (eg. 127.0.0.1:2283)',
+    DEFAULT_RPC_CONSOLE
+  )
+  .option('--insecure', 'Allow insecure connections to the RPC server', false)
+  .option('--watch', 'Keep running and periodically report status', false)
+  .option('-p, --peerId <peerId>', 'Peer id of the hub to compare with (defaults to bootstrap peers)')
+  .action(async (cliOptions) => {
+    let rpcClient;
+    if (cliOptions.insecure) {
+      rpcClient = getInsecureHubRpcClient(cliOptions.server);
+    } else {
+      rpcClient = getSSLHubRpcClient(cliOptions.server);
+    }
+    const infoResult = await rpcClient.getInfo(HubInfoRequest.create({ dbStats: true }));
+    if (infoResult.isErr()) {
+      logger.error(
+        { errCode: infoResult.error.errCode, errMsg: infoResult.error.message },
+        'Failed to get hub status. Do you need to pass in --insecure?'
+      );
+      exit(1);
+    }
+    const dbStats = infoResult.value.dbStats;
+    logger.info(
+      `Hub Version: ${infoResult.value.version} Messages: ${dbStats?.numMessages} FIDs: ${dbStats?.numFidEvents} FNames: ${dbStats?.numFnameEvents}}`
+    );
+    for (;;) {
+      const syncResult = await rpcClient.getSyncStatus(SyncStatusRequest.create({ peerId: cliOptions.peerId }));
+      if (syncResult.isErr()) {
+        logger.error(
+          { errCode: syncResult.error.errCode, errMsg: syncResult.error.message },
+          'Failed to get sync status'
+        );
+        exit(1);
+      }
+
+      let isSyncing = false;
+      const msgPercents: number[] = [];
+      for (const peerStatus of syncResult.value.syncStatus) {
+        const messagePercent = (peerStatus.ourMessages / peerStatus.theirMessages) * 100;
+        msgPercents.push(messagePercent);
+        if (syncResult.value.isSyncing) {
+          isSyncing = true;
+        }
+      }
+      const numPeers = msgPercents.length;
+      if (numPeers === 0) {
+        logger.info('Sync Status: No peers');
+      } else {
+        const avgMsgPercent = msgPercents.reduce((a, b) => a + b, 0) / numPeers;
+        if (isSyncing) {
+          logger.info(
+            `Sync Status: Sync in progress. Hub has ${avgMsgPercent.toFixed(2)}% of messages of ${numPeers} peers`
+          );
+        } else {
+          logger.info(`Sync Status: Hub has ${avgMsgPercent.toFixed(2)}% of messages of ${numPeers} peers`);
+        }
+      }
+
+      if (!cliOptions.watch) {
+        break;
+      }
+
+      await sleep(10_000);
+    }
+    exit(0);
+  });
 
 app
   .command('console')
