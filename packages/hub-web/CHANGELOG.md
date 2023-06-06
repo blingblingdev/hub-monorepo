@@ -1,5 +1,31 @@
 # @farcaster/hub-web
 
+## 0.3.5
+
+### Patch Changes
+
+- 37f515f: Add app version to contactInfo message
+- Updated dependencies [37f515f]
+- Updated dependencies [2bc598a]
+  - @farcaster/core@0.9.0
+
+## 0.3.4
+
+### Patch Changes
+
+- Re-publish
+- Updated dependencies
+  - @farcaster/core@0.8.1
+
+## 0.3.3
+
+### Patch Changes
+
+- 2ca66b17: replace @noble/ed25519 with faster and more secure @noble/curves
+- Updated dependencies [651df412]
+- Updated dependencies [2ca66b17]
+  - @farcaster/core@0.8.0
+
 ## 0.3.2
 
 ### Patch Changes

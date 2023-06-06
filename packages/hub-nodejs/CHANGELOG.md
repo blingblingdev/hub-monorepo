@@ -1,5 +1,34 @@
 # @farcaster/hub-nodejs
 
+## 0.8.0
+
+### Minor Changes
+
+- 2bc598a: Added support for Links
+
+### Patch Changes
+
+- Updated dependencies [37f515f]
+- Updated dependencies [2bc598a]
+  - @farcaster/core@0.9.0
+
+## 0.7.4
+
+### Patch Changes
+
+- Re-publish
+- Updated dependencies
+  - @farcaster/core@0.8.1
+
+## 0.7.3
+
+### Patch Changes
+
+- 2ca66b17: replace @noble/ed25519 with faster and more secure @noble/curves
+- Updated dependencies [651df412]
+- Updated dependencies [2ca66b17]
+  - @farcaster/core@0.8.0
+
 ## 0.7.2
 
 ### Patch Changes

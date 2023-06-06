@@ -1,5 +1,31 @@
 # @farcaster/core
 
+## 0.9.0
+
+### Minor Changes
+
+- 2bc598a: Added support for Links
+
+### Patch Changes
+
+- 37f515f: Add app version to contactInfo message
+
+## 0.8.1
+
+### Patch Changes
+
+- Re-publish
+
+## 0.8.0
+
+### Minor Changes
+
+- 2ca66b17: replace @noble/ed25519 with faster and more secure @noble/curves
+
+### Patch Changes
+
+- 651df412: Remove unnecessary @faker-js/faker dependency from core
+
 ## 0.7.2
 
 ### Patch Changes

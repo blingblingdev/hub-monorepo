@@ -25,9 +25,18 @@ export const MAINNET_ALLOWED_PEERS = [
   '12D3KooWCZBZAirRXA2cecgud2zC7T5iN4hwr9nf7VAn9d8u9px2', // @rss3
   '12D3KooWJwBPFDdCkxWqVE6tCWPs4sDx2t4Pgy2cCewqKzLTRHgr', // @cryptobenkei
   '12D3KooWPaHFmDULq5ahsFM7TQ9tC3UmpiC5XUjtYe9xaoaw7iAs', // @les
-  '12D3KooWEZbpDyiupf2p9dWREfAigKou5wT4jcvxGVTcdXKXBuMu', // Jam.so
   '12D3KooWEr4WoKduAQg8VJSgwcNsqptbdkSQLw1ceEr8oSBQurJX', // @yanisme
   '12D3KooWMZK4VeMX3ZARugTuGexXFHNiGHgNFq6XE2vzi88fMgwC', // @event
   '12D3KooWEs1QcvJcoVv3ihHqqa3yxh4gijegrjyyVkvso2qayUdj', // @colin / @paragraph
   '12D3KooWBhm9XdafZiBWPncDVcvMhcmV3kLFLnBiS83CjY833sWN', // @pjc (fc.bus.events)
+  '12D3KooWFHsw17MsY9eSbYLhkemUYcAwAjPPA7D6g3wTuhnLgAbT', // @sds
+  '12D3KooWKEuT74vxNfhGJh5XGUURaenDj1qokjA811Wv78tFo5WV', // @blanker
+  '12D3KooWCeDDcnpiwRMTGJjxsMayYuUuhRY71QxHxsLtx1ZP2Eq8', // @myz1237
+  '12D3KooWMcDyq1KwcEgSjLixYLEPUZPYwDVFpWcyr8sp9nXCx6Dv', // Jam.so Hub 1
+  '12D3KooWBP4DbXcJrjpwTAsWbLfEXAcWKLQhZoP9HpXrWbbNiogC', // Jam.so Hub 2
+  '12D3KooWNXZSmpCLKBtkS9QyzEqG3qTZARLtKUkShxkTWV2EqsaK', // Jam.so Hub 3
+  '12D3KooWSJj9pDSX5sEFoZum1fsdHuCJnoxwgHKhCg5rrLU7Gepe', // @pfista
+  '12D3KooWDXSemEhSAidFCZT1HyRhTHayunCokg68VSuwStf8UEU5', // @98967eth
+  '12D3KooWHcViME8KUZXo1wStoRF2jmg4edWidexGy5utVyoxNNnn', // @parthkohli
+  '12D3KooWJtEEh7Bcx9T2oKUpcMb9K8xuMFFk5BQNNdJ63Rsx853C', // Jam.so Hub 4
 ];

@@ -12,6 +12,8 @@ import {
   HubServiceServer,
   HubServiceService,
   IdRegistryEvent,
+  LinkAddMessage,
+  LinkRemoveMessage,
   Message,
   MessagesResponse,
   Metadata,
@@ -35,17 +37,21 @@ import {
   SyncStatus,
 } from '@farcaster/hub-nodejs';
 import { err, ok, Result, ResultAsync } from 'neverthrow';
-import { APP_NICKNAME, APP_VERSION, HubInterface } from '~/hubble';
-import { GossipNode } from '~/network/p2p/gossipNode';
-import { NodeMetadata } from '~/network/sync/merkleTrie';
-import SyncEngine from '~/network/sync/syncEngine';
-import Engine from '~/storage/engine';
-import { MessagesPage } from '~/storage/stores/types';
-import { logger } from '~/utils/logger';
-import { addressInfoFromParts } from '~/utils/p2p';
+import { APP_NICKNAME, APP_VERSION, HubInterface } from '../hubble.js';
+import { GossipNode } from '../network/p2p/gossipNode.js';
+import { NodeMetadata } from '../network/sync/merkleTrie.js';
+import SyncEngine from '../network/sync/syncEngine.js';
+import Engine from '../storage/engine/index.js';
+import { MessagesPage } from '../storage/stores/types.js';
+import { logger } from '../utils/logger.js';
+import { addressInfoFromParts } from '../utils/p2p.js';
 import { RateLimiterAbstract, RateLimiterMemory } from 'rate-limiter-flexible';
-import { BufferedStreamWriter } from './bufferedStreamWriter';
-import { sleep } from '~/utils/crypto';
+import {
+  BufferedStreamWriter,
+  STREAM_MESSAGE_BUFFER_SIZE,
+  SLOW_CLIENT_GRACE_PERIOD_MS,
+} from './bufferedStreamWriter.js';
+import { sleep } from '../utils/crypto.js';
 
 export type RpcUsers = Map<string, string[]>;
 
@@ -704,6 +710,51 @@ export default class Server {
           }
         );
       },
+      getLink: async (call, callback) => {
+        const request = call.request;
+
+        const linkResult = await this.engine?.getLink(request.fid, request.linkType, request.targetFid ?? 0);
+        linkResult?.match(
+          (link: LinkAddMessage) => {
+            callback(null, link);
+          },
+          (err: HubError) => {
+            callback(toServiceError(err));
+          }
+        );
+      },
+      getLinksByFid: async (call, callback) => {
+        const { fid, linkType, pageSize, pageToken, reverse } = call.request;
+        const linksResult = await this.engine?.getLinksByFid(fid, linkType, {
+          pageSize,
+          pageToken,
+          reverse,
+        });
+        linksResult?.match(
+          (page: MessagesPage<LinkAddMessage>) => {
+            callback(null, messagesPageToResponse(page));
+          },
+          (err: HubError) => {
+            callback(toServiceError(err));
+          }
+        );
+      },
+      getLinksByTarget: async (call, callback) => {
+        const { targetFid, linkType, pageSize, pageToken, reverse } = call.request;
+        const linksResult = await this.engine?.getLinksByTarget(targetFid ?? 0, linkType, {
+          pageSize,
+          pageToken,
+          reverse,
+        });
+        linksResult?.match(
+          (page: MessagesPage<LinkAddMessage>) => {
+            callback(null, messagesPageToResponse(page));
+          },
+          (err: HubError) => {
+            callback(toServiceError(err));
+          }
+        );
+      },
       getIdRegistryEventByAddress: async (call, callback) => {
         const request = call.request;
         const idRegistryEventResult = await this.engine?.getIdRegistryEventByAddress(request.address);
@@ -813,6 +864,22 @@ export default class Server {
           }
         );
       },
+      getAllLinkMessagesByFid: async (call, callback) => {
+        const { fid, pageSize, pageToken, reverse } = call.request;
+        const result = await this.engine?.getAllLinkMessagesByFid(fid, {
+          pageSize,
+          pageToken,
+          reverse,
+        });
+        result?.match(
+          (page: MessagesPage<LinkAddMessage | LinkRemoveMessage>) => {
+            callback(null, messagesPageToResponse(page));
+          },
+          (err: HubError) => {
+            callback(toServiceError(err));
+          }
+        );
+      },
       getEvent: async (call, callback) => {
         const result = await this.engine?.getEvent(call.request.id);
         result?.match(
@@ -877,11 +944,12 @@ export default class Server {
 
                 return;
               } else {
-                if (writeResult._unsafeUnwrap() === false) {
+                if (writeResult.value === false) {
                   // If the stream was buffered, we can wait for a bit before continuing
                   // to allow the client to read the data. If this happens too much, the bufferedStreamWriter
                   // will timeout and destroy the stream.
-                  await sleep(10);
+                  // The buffered writer is not async to make it easier to preserve ordering guarantees. So, we sleep here
+                  await sleep(SLOW_CLIENT_GRACE_PERIOD_MS / STREAM_MESSAGE_BUFFER_SIZE);
                 }
 
                 // Write was successful, check the RSS usage

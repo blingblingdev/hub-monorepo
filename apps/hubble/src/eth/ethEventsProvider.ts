@@ -10,19 +10,12 @@ import {
   NameRegistryEventType,
   toFarcasterTime,
 } from '@farcaster/hub-nodejs';
-import {
-  AbstractProvider,
-  BaseContractMethod,
-  Contract,
-  ContractEventPayload,
-  EventLog,
-  JsonRpcProvider,
-} from 'ethers';
-import { err, ok, Result, ResultAsync } from 'neverthrow';
-import { IdRegistry, NameRegistry } from '~/eth/abis';
-import { bytes32ToBytes, bytesToBytes32 } from '~/eth/utils';
-import { HubInterface } from '~/hubble';
-import { logger } from '~/utils/logger';
+import { AbstractProvider, BaseContractMethod, Contract, ContractEventPayload, EthersError, EventLog } from 'ethers';
+import { Err, err, Ok, ok, Result, ResultAsync } from 'neverthrow';
+import { IdRegistry, NameRegistry } from './abis.js';
+import { bytes32ToBytes, bytesToBytes32 } from './utils.js';
+import { HubInterface } from '../hubble.js';
+import { logger } from '../utils/logger.js';
 
 const log = logger.child({
   component: 'EthEventsProvider',
@@ -33,6 +26,7 @@ export class GoerliEthConstants {
   public static NameRegistryAddress = '0xe3be01d99baa8db9905b33a3ca391238234b79d1';
   public static FirstBlock = 7648795;
   public static ChunkSize = 10000;
+  public static chainId = BigInt(5);
 }
 
 type NameRegistryRenewEvent = Omit<NameRegistryEvent, 'to' | 'from'>;
@@ -58,6 +52,7 @@ export class EthEventsProvider {
   private _retryDedupMap: Map<number, boolean>;
 
   private _lastBlockNumber: number;
+  private _ethersPromiseCacheDelayMS: number;
 
   // Whether the historical events have been synced. This is used to avoid syncing the events multiple times.
   private _isHistoricalSyncDone = false;
@@ -69,7 +64,8 @@ export class EthEventsProvider {
     nameRegistryContract: Contract,
     firstBlock: number,
     chunkSize: number,
-    resyncEvents: boolean
+    resyncEvents: boolean,
+    ethersPromiseCacheDelayMS = 250
   ) {
     this._hub = hub;
     this._jsonRpcProvider = jsonRpcProvider;
@@ -78,6 +74,7 @@ export class EthEventsProvider {
     this._firstBlock = firstBlock;
     this._chunkSize = chunkSize;
     this._resyncEvents = resyncEvents;
+    this._ethersPromiseCacheDelayMS = ethersPromiseCacheDelayMS;
 
     // Number of blocks to wait before processing an event.
     // This is hardcoded to 6 for now, because that's the threshold beyond which blocks are unlikely to reorg anymore.
@@ -123,27 +120,30 @@ export class EthEventsProvider {
    */
   public static build(
     hub: HubInterface,
-    ethRpcUrl: string,
-    idRegistryAddress: string,
-    nameRegistryAddress: string,
+    rpcProvider: AbstractProvider,
+    idRegistry: string | Contract,
+    nameRegistry: string | Contract,
     firstBlock: number,
     chunkSize: number,
-    resyncEvents: boolean
+    resyncEvents: boolean,
+    ethersPromiseCacheDelayMS = 250
   ): EthEventsProvider {
-    // Setup provider and the contracts
-    const jsonRpcProvider = new JsonRpcProvider(ethRpcUrl);
-
-    const idRegistryContract = new Contract(idRegistryAddress, IdRegistry.abi, jsonRpcProvider);
-    const nameRegistryContract = new Contract(nameRegistryAddress, NameRegistry.abi, jsonRpcProvider);
+    const idRegistryContract = (idRegistry as Contract).target
+      ? (idRegistry as Contract)
+      : new Contract(idRegistry as string, IdRegistry.abi, rpcProvider);
+    const nameRegistryContract = (nameRegistry as Contract).target
+      ? (nameRegistry as Contract)
+      : new Contract(nameRegistry as string, NameRegistry.abi, rpcProvider);
 
     const provider = new EthEventsProvider(
       hub,
-      jsonRpcProvider,
+      rpcProvider,
       idRegistryContract,
       nameRegistryContract,
       firstBlock,
       chunkSize,
-      resyncEvents
+      resyncEvents,
+      ethersPromiseCacheDelayMS
     );
 
     return provider;
@@ -180,8 +180,8 @@ export class EthEventsProvider {
     // it is supposed to  in v6 https://github.com/ethers-io/ethers.js/issues/1138
     const expiryOfMethod = this._nameRegistryContract['expiryOf'] as BaseContractMethod;
 
-    const expiryResult: Result<bigint, HubError> = await ResultAsync.fromPromise(
-      expiryOfMethod(encodedFnameResult.value),
+    const expiryResult: Result<bigint, HubError> = await this.executeCallAsPromiseWithRetry(
+      () => expiryOfMethod(encodedFnameResult.value),
       (err) => new HubError('unavailable.network_failure', err as Error)
     );
 
@@ -194,12 +194,25 @@ export class EthEventsProvider {
 
   /** Connect to Ethereum RPC */
   private async connectAndSyncHistoricalEvents() {
-    const latestBlockResult = await ResultAsync.fromPromise(this._jsonRpcProvider.getBlock('latest'), (err) => err);
+    const latestBlockResult = await this.executeCallAsPromiseWithRetry(
+      () => this._jsonRpcProvider.getBlock('latest'),
+      (err) => err
+    );
     if (latestBlockResult.isErr()) {
       log.error(
         { err: latestBlockResult.error },
         'failed to connect to ethereum node. Check your eth RPC URL (e.g. --eth-rpc-url)'
       );
+      return;
+    }
+
+    const network = await this.executeCallAsPromiseWithRetry(
+      () => this._jsonRpcProvider.getNetwork(),
+      (err) => err
+    );
+
+    if (network.isErr() || network.value.chainId !== GoerliEthConstants.chainId) {
+      log.error({ err: network.isErr() ? network.error : `Wrong network ${network.value.chainId}` }, 'Bad network');
       return;
     }
 
@@ -210,7 +223,7 @@ export class EthEventsProvider {
       return;
     }
 
-    log.info({ latestBlock: latestBlock.number }, 'connected to ethereum node');
+    log.info({ latestBlock: latestBlock.number, network: network.value.chainId }, 'connected to ethereum node');
 
     // Find how how much we need to sync
     let lastSyncedBlock = this._firstBlock;
@@ -292,33 +305,20 @@ export class EthEventsProvider {
       }
 
       // Fetch our batch of blocks
-      let batchIdEvents = await ResultAsync.fromPromise(
+      const batchIdEvents = await this.executeCallAsPromiseWithRetry(
         // Safety: queryFilter will always return EventLog as long as the ABI is valid
-        this._idRegistryContract.queryFilter(typeString, Number(nextFromBlock), Number(nextToBlock)) as Promise<
-          EventLog[]
-        >,
+        () =>
+          this._idRegistryContract.queryFilter(typeString, Number(nextFromBlock), Number(nextToBlock)) as Promise<
+            EventLog[]
+          >,
         (e) => e
       );
 
       // Make sure the batch didn't error, and if it did, retry.
       if (batchIdEvents.isErr()) {
-        // Query for the blocks again, in a last ditch effort
-        const retryBatchIdEvents = await ResultAsync.fromPromise(
-          // Safety: queryFilter will always return EventLog as long as the ABI is valid
-          this._idRegistryContract.queryFilter(typeString, Number(nextFromBlock), Number(nextToBlock)) as Promise<
-            EventLog[]
-          >,
-          (e) => e
-        );
-
-        // If our new query succeeded, update our variable and cache the blocks
-        if (retryBatchIdEvents.isOk()) {
-          batchIdEvents = retryBatchIdEvents;
-        } else {
-          // If we still hit an error, just log the error and return
-          log.error({ err: batchIdEvents.error }, 'failed to get a batch of old ID events');
-          return;
-        }
+        // If we still hit an error, just log the error and return
+        log.error({ err: batchIdEvents.error }, 'failed to get a batch of old ID events');
+        return;
       }
 
       // Loop through each event, get the right values, and cache it
@@ -354,7 +354,7 @@ export class EthEventsProvider {
 
     /*
      * Querying Blocks in Batches
-     *   
+     *
      * 1. Calculate difference between the first and last sync blocks (e.g. )
      * 2. Divide by batch size and round up to get runs, and iterate with for-loop
      * 3. Compute the fromBlock in each run as firstBlock + (loopIndex * batchSize)
@@ -381,32 +381,19 @@ export class EthEventsProvider {
         nextFromBlock += 1;
       }
 
-      let oldNameBatchEvents = await ResultAsync.fromPromise(
+      const oldNameBatchEvents = await this.executeCallAsPromiseWithRetry(
         // Safety: queryFilter will always return EventLog as long as the ABI is valid
-
-        this._nameRegistryContract.queryFilter(typeString, Number(nextFromBlock), Number(nextToBlock)) as Promise<
-          EventLog[]
-        >,
+        () =>
+          this._nameRegistryContract.queryFilter(typeString, Number(nextFromBlock), Number(nextToBlock)) as Promise<
+            EventLog[]
+          >,
         (e) => e
       );
 
       if (oldNameBatchEvents.isErr()) {
-        const retryNameBatchEvents = await ResultAsync.fromPromise(
-          // Safety: queryFilter will always return EventLog as long as the ABI is valid
-          this._nameRegistryContract.queryFilter(typeString, Number(nextFromBlock), Number(nextToBlock)) as Promise<
-            EventLog[]
-          >,
-          (e) => e
-        );
-
-        // If our new query succeeded, update our variable and cache the blocks
-        if (retryNameBatchEvents.isOk()) {
-          oldNameBatchEvents = retryNameBatchEvents;
-        } else {
-          // If we still hit an error, just log the error and return
-          log.error({ err: oldNameBatchEvents.error }, 'failed to get old Name events');
-          return;
-        }
+        // If we still hit an error, just log the error and return
+        log.error({ err: oldNameBatchEvents.error }, 'failed to get old Name events');
+        return;
       }
 
       for (const event of oldNameBatchEvents.value) {
@@ -641,5 +628,45 @@ export class EthEventsProvider {
     logEvent.info(`cacheRenewEvent: token id ${tokenId.toString()} renewed in block ${blockNumber}`);
 
     return ok(undefined);
+  }
+
+  private async executeCallAsPromiseWithRetry<T, E>(
+    call: () => Promise<T>,
+    errorFn: (e: unknown) => E,
+    attempt = 1
+  ): Promise<Result<T, E>> {
+    const result = await ResultAsync.fromPromise(call(), (err) => err);
+
+    if (result.isErr()) {
+      const err = result.error as EthersError;
+      if (err && err.code)
+        switch (err.code) {
+          // non-request-specific ethers errors:
+          case 'UNKNOWN_ERROR':
+          case 'BAD_DATA':
+          case 'SERVER_ERROR':
+          case 'NETWORK_ERROR':
+          case 'TIMEOUT':
+          case 'OFFCHAIN_FAULT':
+            if (attempt !== 3) {
+              const logger = log.child({ event: { rpcError: err.code } });
+              logger.warn(`ethRPCError: RPC returned response ${err.message}, retrying (attempt ${attempt}).`);
+
+              // delay is required because ethers caches results from promises for 250ms, also exponential backoff
+              await new Promise<void>((resolve) =>
+                setTimeout(() => {
+                  resolve();
+                }, this._ethersPromiseCacheDelayMS * Math.pow(attempt, attempt) + 1)
+              );
+
+              return await this.executeCallAsPromiseWithRetry(call, errorFn, attempt + 1);
+            }
+            break;
+        }
+
+      return new Err(errorFn(result.error));
+    }
+
+    return new Ok(result.value);
   }
 }

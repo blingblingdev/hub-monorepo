@@ -21,48 +21,57 @@ import { peerIdFromBytes } from '@libp2p/peer-id';
 import { publicAddressesFirst } from '@libp2p/utils/address-sort';
 import { Multiaddr, multiaddr } from '@multiformats/multiaddr';
 import { Result, ResultAsync, err, ok } from 'neverthrow';
-import { EthEventsProvider, GoerliEthConstants } from '~/eth/ethEventsProvider';
-import { GossipNode, MAX_MESSAGE_QUEUE_SIZE } from '~/network/p2p/gossipNode';
-import { PeriodicSyncJobScheduler } from '~/network/sync/periodicSyncJob';
-import SyncEngine from '~/network/sync/syncEngine';
-import AdminServer from '~/rpc/adminServer';
-import Server from '~/rpc/server';
-import { getHubState, putHubState } from '~/storage/db/hubState';
-import RocksDB from '~/storage/db/rocksdb';
-import { RootPrefix } from '~/storage/db/types';
-import Engine from '~/storage/engine';
-import { PruneEventsJobScheduler } from '~/storage/jobs/pruneEventsJob';
-import { PruneMessagesJobScheduler } from '~/storage/jobs/pruneMessagesJob';
+import { EthEventsProvider, GoerliEthConstants } from './eth/ethEventsProvider.js';
+import { GossipNode, MAX_MESSAGE_QUEUE_SIZE } from './network/p2p/gossipNode.js';
+import { PeriodicSyncJobScheduler } from './network/sync/periodicSyncJob.js';
+import SyncEngine from './network/sync/syncEngine.js';
+import AdminServer from './rpc/adminServer.js';
+import Server from './rpc/server.js';
+import { getHubState, putHubState } from './storage/db/hubState.js';
+import RocksDB from './storage/db/rocksdb.js';
+import { RootPrefix } from './storage/db/types.js';
+import Engine from './storage/engine/index.js';
+import { PruneEventsJobScheduler } from './storage/jobs/pruneEventsJob.js';
+import { PruneMessagesJobScheduler } from './storage/jobs/pruneMessagesJob.js';
 import {
   UpdateNameRegistryEventExpiryJobQueue,
   UpdateNameRegistryEventExpiryJobWorker,
-} from '~/storage/jobs/updateNameRegistryEventExpiryJob';
-import { sleep } from '~/utils/crypto';
-import { idRegistryEventToLog, logger, messageToLog, messageTypeToName, nameRegistryEventToLog } from '~/utils/logger';
+} from './storage/jobs/updateNameRegistryEventExpiryJob.js';
+import { sleep } from './utils/crypto.js';
+import {
+  idRegistryEventToLog,
+  logger,
+  messageToLog,
+  messageTypeToName,
+  nameRegistryEventToLog,
+} from './utils/logger.js';
 import {
   addressInfoFromGossip,
   addressInfoToString,
   getPublicIp,
   ipFamilyToString,
   p2pMultiAddrStr,
-} from '~/utils/p2p';
-import { PeriodicTestDataJobScheduler, TestUser } from '~/utils/periodicTestDataJob';
-import { ensureAboveMinFarcasterVersion, VersionSchedule } from '~/utils/versions';
-import { CheckFarcasterVersionJobScheduler } from '~/storage/jobs/checkFarcasterVersionJob';
-import { ValidateOrRevokeMessagesJobScheduler } from '~/storage/jobs/validateOrRevokeMessagesJob';
-import { GossipContactInfoJobScheduler } from '~/storage/jobs/gossipContactInfoJob';
-import { MAINNET_ALLOWED_PEERS } from './allowedPeers.mainnet';
-import StoreEventHandler from '~/storage/stores/storeEventHandler';
+} from './utils/p2p.js';
+import { PeriodicTestDataJobScheduler, TestUser } from './utils/periodicTestDataJob.js';
+import { ensureAboveMinFarcasterVersion, VersionSchedule } from './utils/versions.js';
+import { CheckFarcasterVersionJobScheduler } from './storage/jobs/checkFarcasterVersionJob.js';
+import { ValidateOrRevokeMessagesJobScheduler } from './storage/jobs/validateOrRevokeMessagesJob.js';
+import { GossipContactInfoJobScheduler } from './storage/jobs/gossipContactInfoJob.js';
+import { MAINNET_ALLOWED_PEERS } from './allowedPeers.mainnet.js';
+import StoreEventHandler from './storage/stores/storeEventHandler.js';
+import { RetryProvider } from './eth/retryProvider.js';
+import { JsonRpcProvider } from 'ethers';
 
 export type HubSubmitSource = 'gossip' | 'rpc' | 'eth-provider' | 'sync';
 
 export const APP_VERSION = process.env['npm_package_version'] ?? '1.0.0';
 export const APP_NICKNAME = process.env['HUBBLE_NAME'] ?? 'Farcaster Hub';
 
-export const FARCASTER_VERSION = '2023.4.19';
+export const FARCASTER_VERSION = '2023.5.31';
 export const FARCASTER_VERSIONS_SCHEDULE: VersionSchedule[] = [
   { version: '2023.3.1', expiresAt: 1682553600000 }, // expires at 4/27/23 00:00 UTC
   { version: '2023.4.19', expiresAt: 1686700800000 }, // expires at 6/14/23 00:00 UTC
+  { version: '2023.5.31', expiresAt: 1690329600000 }, // expires at 7/26/23 00:00 UTC
 ];
 
 export interface HubInterface {
@@ -209,9 +218,12 @@ export class Hub implements HubInterface {
     // Create the ETH registry provider, which will fetch ETH events and push them into the engine.
     // Defaults to Goerli testnet, which is currently used for Production Farcaster Hubs.
     if (options.ethRpcUrl) {
+      const RetryingJsonRPCProvider = RetryProvider(JsonRpcProvider);
+      const jsonRpcProvider = new RetryingJsonRPCProvider(options.ethRpcUrl);
+
       this.ethRegistryProvider = EthEventsProvider.build(
         this,
-        options.ethRpcUrl,
+        jsonRpcProvider,
         options.idRegistryAddress ?? GoerliEthConstants.IdRegistryAddress,
         options.nameRegistryAddress ?? GoerliEthConstants.NameRegistryAddress,
         options.firstBlock ?? GoerliEthConstants.FirstBlock,
@@ -344,7 +356,9 @@ export class Hub implements HubInterface {
 
     // Set the network in the DB
     await this.setDbNetwork(this.options.network);
-    log.info(`starting hub with Farcaster version ${FARCASTER_VERSION} and network ${this.options.network}`);
+    log.info(
+      `starting hub with Farcaster version ${FARCASTER_VERSION}, app version ${APP_VERSION} and network ${this.options.network}`
+    );
 
     await this.engine.start();
 
@@ -423,6 +437,7 @@ export class Hub implements HubInterface {
         count: snapshot.numMessages,
         hubVersion: FARCASTER_VERSION,
         network: this.options.network,
+        appVersion: APP_VERSION,
       });
     });
   }
