@@ -7,7 +7,7 @@ export const MAINNET_ALLOWED_PEERS = [
   '12D3KooWHiyvASqvhGn9kqsLBemPTAF6UYEaFGaLUpPxnM54KFbG', // @deodad
   '12D3KooWKXAG1Z212HHrwYaW5NnwBxoXkk3Sr7USzRxMzS9pieZi', // @paden
   '12D3KooWFbnaXtbD5fwbMGq2JRjPaj7C6EpZRgaxC8jdtcX7FJbZ', // @v
-  '12D3KooWMDdQaMWCkQ8Gf3C6zdJdMEfFs8R2pw8YQw2HgoY8qhzA', // @adityapk
+  '12D3KooWNr294AH1fviDQxRmQ4K79iFSGoRCWzGspVxPprJUKN47', // @adityapk
   '12D3KooWKwUpms7tgUoVsjQ2uV9g93hS2UiMRUfR8f4xjMtsk1Kq', // @pfh
   '12D3KooWATZKmurjSqWHfcLBgD4oYbNYiAHZ5VPq8W2kNid5TEuL', // @df
   '12D3KooWMnmYq2BDGKJ76w5pFyz2c1ZsK8pMvu6wxyg747j3p679', // @eddy
@@ -46,4 +46,9 @@ export const MAINNET_ALLOWED_PEERS = [
   '12D3KooWRDvjugV5fhkTA2BBmrLXmKyBXLe4V7YJyMXyLQGj1PAM', // @rysiman
   '12D3KooWNLshuXk4x2gacFTMEJjMGGFxPjpHg5KcV88KoqJP7dDR', // @bhgomes
   '12D3KooWS39hrt41rMuD5ZfPFMxUVycxVwz7w15CxZVhxP4AZDGr', // @rozhnovskiyigor
+  '12D3KooWHXZkdEYWb5RCajv7YbffasjYNSEP1U68DMR1JeZ4QiXH', // @fedecastelli
+  '12D3KooWCPdo8CNq3pu7oyJQYFzV6d4GbHUH8HTUbtHM6jpv6buy', // @cameron
+  '12D3KooWHguasQqxAK9px8i5NDMFSG7VYhHRt4C7d2brpjakh5Sk', // @mboyle
+  '12D3KooWDfxjnmTTk2nb89dBZZrCQ7g71BoJELKnVpUQUTt4YcL4', // @razzle
+  '12D3KooWEoXRpLMjiRo9KxVHqg8Ng5gJxkJdd9uDotSNfYy8jFNv', // @pseudobun
 ];
