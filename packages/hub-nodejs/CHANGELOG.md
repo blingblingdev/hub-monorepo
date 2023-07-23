@@ -1,5 +1,25 @@
 # @farcaster/hub-nodejs
 
+## 0.9.1
+
+### Patch Changes
+
+- Updated dependencies [e36fcae]
+- Updated dependencies [88f31f2]
+  - @farcaster/core@0.11.1
+
+## 0.9.0
+
+### Minor Changes
+
+- 2391c3a5: Adds support for storage events
+
+### Patch Changes
+
+- 57235761: Remove ethers dependency
+- Updated dependencies [2391c3a5]
+  - @farcaster/core@0.11.0
+
 ## 0.8.4
 
 ### Patch Changes

@@ -6,8 +6,6 @@ import {
   CastRemoveMessage,
   Factories,
   FarcasterNetwork,
-  fromFarcasterTime,
-  getFarcasterTime,
   hexStringToBytes,
   HubError,
   HubEvent,
@@ -29,6 +27,7 @@ import {
   RevokeMessageHubEvent,
   SignerAddMessage,
   SignerRemoveMessage,
+  toFarcasterTime,
   UserDataAddMessage,
   UserDataType,
   UserNameProof,
@@ -48,6 +47,7 @@ import { setReferenceDateForTest } from "../../utils/versions.js";
 import { getUserNameProof } from "../db/nameRegistryEvent.js";
 import { publicClient } from "../../test/utils.js";
 import { jest } from "@jest/globals";
+import { RevokeMessagesBySignerJobQueue, RevokeMessagesBySignerJobWorker } from "../jobs/revokeMessagesBySignerJob.js";
 
 const db = jestRocksDB("protobufs.engine.test");
 const network = FarcasterNetwork.TESTNET;
@@ -80,7 +80,7 @@ beforeAll(async () => {
   custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySignerKey });
 
   fnameTransfer = Factories.NameRegistryEvent.build({ fname, to: custodyEvent.to });
-  userNameProof = Factories.UserNameProof.build({ name: fname, owner: custodyEvent.to });
+  userNameProof = Factories.UserNameProof.build({ name: fname, owner: custodyEvent.to, fid: fid });
 
   signerAdd = await Factories.SignerAddMessage.create(
     { data: { fid, network, signerAddBody: { signer: signerKey } } },
@@ -257,8 +257,20 @@ describe("mergeMessage", () => {
           );
         });
 
-        test("succeeds when fname owned by custody address", async () => {
+        test("succeeds when fname owned by same fid", async () => {
           await expect(engine.mergeUserNameProof(userNameProof)).resolves.toBeInstanceOf(Ok);
+          await expect(engine.mergeMessage(usernameAdd)).resolves.toBeInstanceOf(Ok);
+        });
+
+        test("succeeds when fname owned by same fid but different custody address", async () => {
+          const proof = Factories.UserNameProof.build({
+            name: userNameProof.name,
+            timestamp: userNameProof.timestamp + 1,
+            owner: Factories.EthAddress.build(),
+            fid: fid,
+          });
+
+          await expect(engine.mergeUserNameProof(proof)).resolves.toBeInstanceOf(Ok);
           await expect(engine.mergeMessage(usernameAdd)).resolves.toBeInstanceOf(Ok);
         });
 
@@ -268,11 +280,12 @@ describe("mergeMessage", () => {
           expect(result._unsafeUnwrapErr().message).toMatch("is not registered");
         });
 
-        test("fails when fname is owned by another custody address", async () => {
+        test("fails when fname is owned by another fid", async () => {
           const proof = Factories.UserNameProof.build({
             name: userNameProof.name,
             timestamp: userNameProof.timestamp + 1,
             owner: Factories.EthAddress.build(),
+            fid: Factories.Fid.build(),
           });
           await expect(engine.mergeUserNameProof(proof)).resolves.toBeInstanceOf(Ok);
           const result = await engine.mergeMessage(usernameAdd);
@@ -476,7 +489,8 @@ describe("mergeMessage", () => {
     });
 
     const createProof = async (name: string, timestamp?: number | null, owner?: string | null) => {
-      const ts = timestamp ?? getFarcasterTime()._unsafeUnwrap();
+      // Proof time is in Unix seconds and should match the message time which is in Farcaster milliseconds
+      const timestampSec = Math.floor((timestamp || Date.now()) / 1000);
       const ownerAsBytes = owner ? hexStringToBytes(owner)._unsafeUnwrap() : Factories.EthAddress.build();
       return await Factories.UsernameProofMessage.create(
         {
@@ -486,10 +500,10 @@ describe("mergeMessage", () => {
               name: utf8StringToBytes(name)._unsafeUnwrap(),
               fid,
               owner: ownerAsBytes,
-              timestamp: fromFarcasterTime(ts)._unsafeUnwrap(),
+              timestamp: timestampSec,
               type: UserNameType.USERNAME_TYPE_ENS_L1,
             }),
-            timestamp: ts,
+            timestamp: toFarcasterTime(timestampSec * 1000)._unsafeUnwrap(),
             type: MessageType.USERNAME_PROOF,
           },
         },
@@ -869,9 +883,22 @@ describe("with listeners and workers", () => {
         blockNumber: custodyEvent.blockNumber + 1,
       });
       await liveEngine.mergeIdRegistryEvent(custodyTransfer);
+      await sleep(200);
+      // Does not immediately revoke messages, will wait 1 hr
       expect(revokedMessages).toEqual([]);
-      await sleep(200); // Wait for engine to revoke messages
-      expect(revokedMessages).toEqual([signerAdd, castAdd, reactionAdd, linkAdd]);
+
+      // Manually trigger the job
+      const queue = new RevokeMessagesBySignerJobQueue(db);
+      const worker = new RevokeMessagesBySignerJobWorker(queue, db, liveEngine);
+      await worker.processJobs(Date.now() + 1000 * 10 * 60 + 5000);
+      expect(revokedMessages).toEqual([]); // No messages revoked yet, after 10 mins
+
+      // Revokes messages after 1 hr
+      await worker.processJobs(Date.now() + 1000 * 60 * 60 + 5000);
+      expect(revokedMessages).toContainEqual(signerAdd);
+      expect(revokedMessages).toContainEqual(castAdd);
+      expect(revokedMessages).toContainEqual(reactionAdd);
+      expect(revokedMessages).toContainEqual(linkAdd);
     });
 
     test("revokes messages when SignerAdd is pruned", async () => {
@@ -896,14 +923,20 @@ describe("with listeners and workers", () => {
       expect(revokedMessages).toEqual([signerAdd, castAdd, reactionAdd, linkAdd]);
     });
 
-    test("revokes UserDataAdd when fname is transferred", async () => {
+    test("does not revoke UserDataAdd when fname is transferred to different address but same fid", async () => {
       const fname = Factories.Fname.build();
       const nameProof = Factories.UserNameProof.build({
         name: fname,
         fid,
         owner: custodyEvent.to,
       });
+      const anotherNameProof = Factories.UserNameProof.build({
+        name: Factories.Fname.build(),
+        fid,
+        owner: custodyEvent.to,
+      });
       await expect(liveEngine.mergeUserNameProof(nameProof)).resolves.toBeInstanceOf(Ok);
+      await expect(liveEngine.mergeUserNameProof(anotherNameProof)).resolves.toBeInstanceOf(Ok);
       const fnameAdd = await Factories.UserDataAddMessage.create(
         {
           data: {
@@ -914,44 +947,41 @@ describe("with listeners and workers", () => {
         { transient: { signer } },
       );
       await expect(liveEngine.mergeMessage(fnameAdd)).resolves.toBeInstanceOf(Ok);
-      const nameTransfer = Factories.UserNameProof.build({
+      const nameTransferToDifferentOwnerAddress = Factories.UserNameProof.build({
         name: fname,
         fid,
         owner: Factories.EthAddress.build(),
         timestamp: nameProof.timestamp + 1,
       });
-      await expect(liveEngine.mergeUserNameProof(nameTransfer)).resolves.toBeInstanceOf(Ok);
-      expect(revokedMessages).toEqual([]);
-      await sleep(200); // Wait for engine to revoke messages
-      expect(revokedMessages).toEqual([fnameAdd]);
-    });
-
-    test("revokes UserDataAdd when fid is transferred", async () => {
-      const fname = Factories.Fname.build();
-      const nameProof = Factories.UserNameProof.build({
+      const nameTransferToDifferentFid = Factories.UserNameProof.build({
         name: fname,
-        owner: custodyEvent.to,
+        fid: Factories.Fid.build(),
+        owner: Factories.EthAddress.build(),
+        timestamp: nameProof.timestamp + 2,
       });
-      await expect(liveEngine.mergeUserNameProof(nameProof)).resolves.toBeInstanceOf(Ok);
-      const fnameAdd = await Factories.UserDataAddMessage.create(
-        {
-          data: {
-            userDataBody: { type: UserDataType.USERNAME, value: bytesToUtf8String(fname)._unsafeUnwrap() },
-            fid,
-          },
-        },
-        { transient: { signer } },
-      );
-      await expect(liveEngine.mergeMessage(fnameAdd)).resolves.toBeInstanceOf(Ok);
-      const custodyTransfer = Factories.IdRegistryEvent.build({
+      const anotherNameTransfer = Factories.UserNameProof.build({
+        name: anotherNameProof.name,
         fid,
-        from: custodyEvent.to,
-        blockNumber: custodyEvent.blockNumber + 1,
+        owner: Factories.EthAddress.build(),
+        timestamp: anotherNameProof.timestamp + 1,
       });
-      await expect(liveEngine.mergeIdRegistryEvent(custodyTransfer)).resolves.toBeInstanceOf(Ok);
+      await expect(liveEngine.mergeUserNameProof(anotherNameTransfer)).resolves.toBeInstanceOf(Ok);
       expect(revokedMessages).toEqual([]);
       await sleep(200); // Wait for engine to revoke messages
-      expect(revokedMessages).toContainEqual(fnameAdd);
+      // Does not revoke name because current username has not been transferred yet
+      expect(revokedMessages).toEqual([]);
+
+      await expect(liveEngine.mergeUserNameProof(nameTransferToDifferentOwnerAddress)).resolves.toBeInstanceOf(Ok);
+      expect(revokedMessages).toEqual([]);
+      await sleep(200); // Wait for engine to revoke messages
+      // Does not revoke name because username belongs to the same fid
+      expect(revokedMessages).toEqual([]);
+
+      await expect(liveEngine.mergeUserNameProof(nameTransferToDifferentFid)).resolves.toBeInstanceOf(Ok);
+      expect(revokedMessages).toEqual([]);
+      await sleep(200); // Wait for engine to revoke messages
+      // Revokes because fid does not own the name anymore
+      expect(revokedMessages).toEqual([fnameAdd]);
     });
   });
 });

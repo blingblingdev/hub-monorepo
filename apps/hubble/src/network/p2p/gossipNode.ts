@@ -29,6 +29,7 @@ import { PeriodicPeerCheckScheduler } from "./periodicPeerCheck.js";
 import { GOSSIP_PROTOCOL_VERSION, msgIdFnStrictSign } from "./protocol.js";
 import { GossipMetricsRecorder } from "./gossipMetricsRecorder.js";
 import RocksDB from "storage/db/rocksdb.js";
+import { AddrInfo } from "@chainsafe/libp2p-gossipsub/types";
 
 const MultiaddrLocalHost = "/ip4/127.0.0.1";
 
@@ -57,8 +58,10 @@ interface NodeOptions {
   announceIp?: string | undefined;
   /** A port used to listen for gossip messages. A random value is selected if not specified */
   gossipPort?: number | undefined;
-  /** A list of PeedIds that are allowed to connect to this node */
+  /** A list of PeerIds that are allowed to connect to this node */
   allowedPeerIdStrs?: string[] | undefined;
+  /** A list of addresses the node directly peers with, provided in MultiAddr format */
+  directPeers?: AddrInfo[] | undefined;
 }
 
 /**
@@ -73,6 +76,8 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
   private _periodicPeerCheckJob?: PeriodicPeerCheckScheduler;
   private _network: FarcasterNetwork;
   private _metricsRecorder?: GossipMetricsRecorder;
+
+  private _connectionGater?: ConnectionFilter;
 
   constructor(db: RocksDB, network?: FarcasterNetwork, networkLatencyMessagesEnabled?: boolean) {
     super();
@@ -310,9 +315,17 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
     return err(new HubError("unavailable", { message: `cannot connect to peer: ${address}` }));
   }
 
+  /** Return if we have any inbound P2P connections */
+  hasInboundConnections(): boolean {
+    return this._node?.getConnections().some((conn) => conn.stat.direction === "inbound") ?? false;
+  }
+
   registerListeners() {
     this._node?.addEventListener("peer:connect", (event) => {
-      log.info({ peer: event.detail.remotePeer }, "P2P Connection established");
+      log.info(
+        { peer: event.detail.remotePeer, addrs: event.detail.remoteAddr, type: event.detail.stat.direction },
+        "P2P Connection established",
+      );
       this.emit("peerConnect", event.detail);
     });
     this._node?.addEventListener("peer:disconnect", (event) => {
@@ -374,6 +387,10 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
 
   allPeerIds(): string[] {
     return this._node?.getPeers()?.map((peer) => peer.toString()) ?? [];
+  }
+
+  updateAllowedPeerIds(peerIds: string[]) {
+    this._connectionGater?.updateAllowedPeers(peerIds);
   }
 
   //TODO: Needs better typesafety
@@ -463,6 +480,7 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
       allowPublishToZeroPeers: true,
       globalSignaturePolicy: "StrictSign",
       msgIdFn: this.getMessageId.bind(this),
+      directPeers: options.directPeers || [],
     });
 
     if (options.allowedPeerIdStrs) {
@@ -471,13 +489,13 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
         "!!! PEER-ID RESTRICTIONS ENABLED !!!",
       );
     }
-    const connectionGater = new ConnectionFilter(options.allowedPeerIdStrs);
+    this._connectionGater = new ConnectionFilter(options.allowedPeerIdStrs);
 
     return ResultAsync.fromPromise(
       createLibp2p({
         // Only set optional fields if defined to avoid errors
         ...(options.peerId && { peerId: options.peerId }),
-        connectionGater,
+        connectionGater: this._connectionGater,
         addresses: {
           listen: [listenMultiAddrStr],
           announce: announceMultiAddrStrList,

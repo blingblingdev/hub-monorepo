@@ -184,6 +184,10 @@ class Engine {
     log.info("engine stopped");
   }
 
+  getDb(): RocksDB {
+    return this._db;
+  }
+
   async mergeMessages(messages: Message[]): Promise<Array<HubResult<number>>> {
     return Promise.all(messages.map((message) => this.mergeMessage(message)));
   }
@@ -888,20 +892,14 @@ class Engine {
         }
 
         if (nameProof.value.type === UserNameType.USERNAME_TYPE_FNAME) {
-          // Check that the custody address for the fname and fid are the same
-          if (bytesCompare(custodyEvent.value.to, nameProof.value.owner) !== 0) {
-            const hex = Result.combine([
-              bytesToHexString(custodyEvent.value.to),
-              bytesToHexString(nameProof.value.owner),
-            ]);
-            return hex.andThen(([custodySignerHex, fnameOwnerHex]) => {
-              return err(
-                new HubError(
-                  "bad_request.validation_failure",
-                  `fname custody address ${fnameOwnerHex} does not match custody address ${custodySignerHex} for fid ${message.data.fid}`,
-                ),
-              );
-            });
+          // Check that the fid for the fname and message are the same
+          if (nameProof.value.fid !== message.data.fid) {
+            return err(
+              new HubError(
+                "bad_request.validation_failure",
+                `fname fid ${nameProof.value.fid} does not match message fid ${message.data.fid}`,
+              ),
+            );
           }
         } else if (nameProof.value.type === UserNameType.USERNAME_TYPE_ENS_L1) {
           const result = await this.validateEnsUsernameProof(nameProof.value, custodyEvent.value.to);
@@ -983,36 +981,12 @@ class Engine {
         fid: idRegistryEvent.fid,
         signer: fromAddress,
       });
-      const enqueueRevoke = await this._revokeSignerQueue.enqueueJob(payload);
+      const oneHourFromNow = Date.now() + 60 * 60 * 1000;
+      const enqueueRevoke = await this._revokeSignerQueue.enqueueJob(payload, oneHourFromNow);
       if (enqueueRevoke.isErr()) {
         log.error(
           { errCode: enqueueRevoke.error.errCode },
           `failed to enqueue revoke signer job: ${enqueueRevoke.error.message}`,
-        );
-      }
-
-      // Revoke UserDataAdd fname messages
-      const fnameAdd = await ResultAsync.fromPromise(
-        this._userDataStore.getUserDataAdd(idRegistryEvent.fid, UserDataType.USERNAME),
-        () => undefined,
-      );
-      if (fnameAdd.isOk()) {
-        const revokeResult = await this._userDataStore.revoke(fnameAdd.value);
-        const fnameAddHex = bytesToHexString(fnameAdd.value.hash);
-        revokeResult.match(
-          () =>
-            log.info(
-              `revoked message ${fnameAddHex._unsafeUnwrap()} for fid ${
-                idRegistryEvent.fid
-              } due to IdRegistryEvent transfer`,
-            ),
-          (e) =>
-            log.error(
-              { errCode: e.errCode },
-              `failed to revoke message ${fnameAddHex._unsafeUnwrap()} for fid ${
-                idRegistryEvent.fid
-              } due to IdRegistryEvent transfer: ${e.message}`,
-            ),
         );
       }
     }
@@ -1021,11 +995,19 @@ class Engine {
   }
 
   private async handleMergeUsernameProofEvent(event: MergeUsernameProofHubEvent): HubAsyncResult<void> {
-    const { deletedUsernameProof } = event.mergeUsernameProofBody;
+    const { deletedUsernameProof, usernameProof } = event.mergeUsernameProofBody;
 
     // When there is a UserNameProof, we need to check if we need to revoke UserDataAdd messages from the
     // previous owner of the name.
     if (deletedUsernameProof && deletedUsernameProof.owner.length > 0) {
+      // If the name and the fid are the same (proof just has a newer timestamp or different owner address) then we don't need to revoke
+      if (
+        usernameProof &&
+        bytesCompare(deletedUsernameProof.name, usernameProof.name) === 0 &&
+        deletedUsernameProof.fid === usernameProof.fid
+      ) {
+        return ok(undefined);
+      }
       const fid = deletedUsernameProof.fid;
 
       // Check if this fid assigned the name with a UserDataAdd message
@@ -1034,6 +1016,20 @@ class Engine {
         () => undefined,
       );
       if (usernameAdd.isOk()) {
+        const nameBytes = utf8StringToBytes(usernameAdd.value.data.userDataBody.value);
+        if (!nameBytes.isOk()) {
+          log.error(
+            `failed to convert username add message ${bytesToHexString(
+              usernameAdd.value.hash,
+            )} for fid ${fid} to utf8 string`,
+          );
+          return err(nameBytes.error);
+        }
+        if (bytesCompare(nameBytes.value, deletedUsernameProof.name) !== 0) {
+          log.debug(`deleted name proof for ${fid} does not match current user name, skipping revoke`);
+          return ok(undefined);
+        }
+
         const revokeResult = await this._userDataStore.revoke(usernameAdd.value);
         const usernameAddHex = bytesToHexString(usernameAdd.value.hash);
         revokeResult.match(

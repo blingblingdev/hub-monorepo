@@ -73,8 +73,12 @@ import { L2EventsProvider, OPGoerliEthConstants } from "./eth/l2EventsProvider.j
 import { GOSSIP_PROTOCOL_VERSION } from "./network/p2p/protocol.js";
 import { prettyPrintTable } from "./profile.js";
 import packageJson from "./package.json" assert { type: "json" };
-import { createPublicClient, http } from "viem";
+import { createPublicClient, fallback, http } from "viem";
 import { mainnet } from "viem/chains";
+import { AddrInfo } from "@chainsafe/libp2p-gossipsub/types";
+import { CheckIncomingPortsJobScheduler } from "./storage/jobs/checkIncomingPortsJob.js";
+import { NetworkConfig, applyNetworkConfig, fetchNetworkConfig } from "./network/utils/networkConfig.js";
+import { UpdateNetworkConfigJobScheduler } from "./storage/jobs/updateNetworkConfigJob.js";
 
 export type HubSubmitSource = "gossip" | "rpc" | "eth-provider" | "l2-provider" | "sync" | "fname-registry";
 
@@ -140,16 +144,19 @@ export interface HubOptions {
   /** Enable IP Rate limiting */
   rpcRateLimit?: number;
 
-  /** Network URL of the IdRegistry Contract */
+  /** Rank RPCs and use the ones with best stability and latency */
+  rankRpcs?: boolean;
+
+  /** Network URL(s) of the IdRegistry Contract */
   ethRpcUrl?: string;
 
-  /** ETH mainnet RPC URL */
+  /** ETH mainnet RPC URL(s) */
   ethMainnetRpcUrl?: string;
 
   /** FName Registry Server URL */
   fnameServerUrl?: string;
 
-  /** Network URL of the StorageRegistry Contract */
+  /** Network URL(s) of the StorageRegistry Contract */
   l2RpcUrl?: string;
 
   /** Address of the IdRegistry contract  */
@@ -221,6 +228,9 @@ export interface HubOptions {
 
   /** Periodically send network latency ping messages to the gossip network and log metrics */
   gossipMetricsEnabled?: boolean;
+
+  /** A list of addresses the node directly peers with, provided in MultiAddr format */
+  directPeers?: AddrInfo[];
 }
 
 /** @returns A randomized string of the format `rocksdb.tmp.*` used for the DB Name */
@@ -240,7 +250,7 @@ export class Hub implements HubInterface {
   private contactTimer?: NodeJS.Timer;
   private rocksDB: RocksDB;
   private syncEngine: SyncEngine;
-  private allowedPeerIds: string[] = [];
+  private allowedPeerIds: string[] | undefined;
 
   private pruneMessagesJobScheduler: PruneMessagesJobScheduler;
   private periodSyncJobScheduler: PeriodicSyncJobScheduler;
@@ -249,6 +259,8 @@ export class Hub implements HubInterface {
   private checkFarcasterVersionJobScheduler: CheckFarcasterVersionJobScheduler;
   private validateOrRevokeMessagesJobScheduler: ValidateOrRevokeMessagesJobScheduler;
   private gossipContactInfoJobScheduler: GossipContactInfoJobScheduler;
+  private checkIncomingPortsJobScheduler: CheckIncomingPortsJobScheduler;
+  private updateNetworkConfigJobScheduler: UpdateNetworkConfigJobScheduler;
 
   private updateNameRegistryEventExpiryJobQueue: UpdateNameRegistryEventExpiryJobQueue;
   private updateNameRegistryEventExpiryJobWorker?: UpdateNameRegistryEventExpiryJobWorker;
@@ -269,6 +281,7 @@ export class Hub implements HubInterface {
       this.ethRegistryProvider = EthEventsProvider.build(
         this,
         options.ethRpcUrl,
+        options.rankRpcs ?? false,
         options.idRegistryAddress ?? GoerliEthConstants.IdRegistryAddress,
         options.nameRegistryAddress ?? GoerliEthConstants.NameRegistryAddress,
         options.firstBlock ?? GoerliEthConstants.FirstBlock,
@@ -291,6 +304,7 @@ export class Hub implements HubInterface {
       this.l2RegistryProvider = L2EventsProvider.build(
         this,
         options.l2RpcUrl,
+        options.rankRpcs ?? false,
         options.storageRegistryAddress ?? OPGoerliEthConstants.StorageRegistryAddress,
         options.l2FirstBlock ?? OPGoerliEthConstants.FirstBlock,
         options.l2ChunkSize ?? OPGoerliEthConstants.ChunkSize,
@@ -316,9 +330,11 @@ export class Hub implements HubInterface {
       lockTimeout: options.commitLockTimeout,
     });
 
+    const ethMainnetRpcUrls = options.ethMainnetRpcUrl.split(",");
+    const transports = ethMainnetRpcUrls.map((url) => http(url, { retryCount: 2 }));
     const mainnetClient = createPublicClient({
       chain: mainnet,
-      transport: http(options.ethMainnetRpcUrl, { retryCount: 2 }),
+      transport: fallback(transports, { rank: options.rankRpcs ?? false }),
     });
 
     this.engine = new Engine(this.rocksDB, options.network, eventHandler, mainnetClient);
@@ -385,6 +401,8 @@ export class Hub implements HubInterface {
     this.checkFarcasterVersionJobScheduler = new CheckFarcasterVersionJobScheduler(this);
     this.validateOrRevokeMessagesJobScheduler = new ValidateOrRevokeMessagesJobScheduler(this.rocksDB, this.engine);
     this.gossipContactInfoJobScheduler = new GossipContactInfoJobScheduler(this);
+    this.checkIncomingPortsJobScheduler = new CheckIncomingPortsJobScheduler(this.rpcServer, this.gossipNode);
+    this.updateNetworkConfigJobScheduler = new UpdateNetworkConfigJobScheduler(this);
 
     if (options.testUsers) {
       this.testDataJobScheduler = new PeriodicTestDataJobScheduler(this.rpcServer, options.testUsers as TestUser[]);
@@ -406,7 +424,7 @@ export class Hub implements HubInterface {
     //   );
     // }
 
-    this.allowedPeerIds = this.options.allowedPeers || [];
+    this.allowedPeerIds = this.options.allowedPeers;
     if (this.options.network === FarcasterNetwork.MAINNET) {
       // Mainnet is right now resitrcited to a few peers
       // Append and de-dup the allowed peers
@@ -498,6 +516,19 @@ export class Hub implements HubInterface {
       `starting hub with Farcaster version ${FARCASTER_VERSION}, app version ${APP_VERSION} and network ${this.options.network}`,
     );
 
+    // Fetch network config
+    const networkConfig = await fetchNetworkConfig();
+    if (networkConfig.isErr()) {
+      log.error("failed to fetch network config", { error: networkConfig.error });
+    } else {
+      const shouldExit = this.applyNetworkConfig(networkConfig.value);
+      if (shouldExit) {
+        throw new HubError("unavailable", "Exiting due to network config");
+      }
+
+      log.info({}, "Network config applied");
+    }
+
     await this.engine.start();
 
     // Start the RPC server
@@ -531,6 +562,7 @@ export class Hub implements HubInterface {
       announceIp: this.options.announceIp,
       gossipPort: this.options.gossipPort,
       allowedPeerIdStrs: this.allowedPeerIds,
+      directPeers: this.options.directPeers,
     });
 
     this.registerEventHandlers();
@@ -541,6 +573,9 @@ export class Hub implements HubInterface {
     this.pruneEventsJobScheduler.start(this.options.pruneEventsJobCron);
     this.checkFarcasterVersionJobScheduler.start();
     this.validateOrRevokeMessagesJobScheduler.start();
+    this.gossipContactInfoJobScheduler.start();
+    this.checkIncomingPortsJobScheduler.start();
+    this.updateNetworkConfigJobScheduler.start();
 
     // Start the test data generator
     this.testDataJobScheduler?.start();
@@ -549,6 +584,23 @@ export class Hub implements HubInterface {
     // shutdown, we'll write "true" to this key, indicating that we've cleanly shutdown.
     // This way, when starting up, we'll know if the previous shutdown was clean or not.
     await this.writeHubCleanShutdown(false);
+  }
+
+  /** Apply the new the network config. Will return true if the Hub should exit */
+  public applyNetworkConfig(networkConfig: NetworkConfig): boolean {
+    const { allowedPeerIds, shouldExit } = applyNetworkConfig(
+      networkConfig,
+      this.allowedPeerIds ?? [],
+      this.options.network,
+    );
+
+    if (shouldExit) {
+      return true;
+    } else {
+      this.gossipNode.updateAllowedPeerIds(allowedPeerIds);
+      this.allowedPeerIds = allowedPeerIds;
+      return false;
+    }
   }
 
   async getContactInfoContent(): HubAsyncResult<ContactInfoContent> {
@@ -580,6 +632,10 @@ export class Hub implements HubInterface {
     });
   }
 
+  async teardown() {
+    await this.stop();
+  }
+
   /** Stop the GossipNode and RPC Server */
   async stop() {
     log.info("Stopping Hubble...");
@@ -603,6 +659,9 @@ export class Hub implements HubInterface {
     this.testDataJobScheduler?.stop();
     this.updateNameRegistryEventExpiryJobWorker?.stop();
     this.validateOrRevokeMessagesJobScheduler.stop();
+    this.gossipContactInfoJobScheduler.stop();
+    this.checkIncomingPortsJobScheduler.stop();
+    this.updateNetworkConfigJobScheduler.stop();
 
     // Stop the ETH registry provider
     if (this.ethRegistryProvider) {
@@ -753,23 +812,23 @@ export class Hub implements HubInterface {
       await this.gossipNode.addPeerToAddressBook(peerId, multiaddrValue);
     }
 
-    log.info({ identity: this.identity, peer: peerId, message }, "received a Contact Info for sync");
+    log.debug({ identity: this.identity, peer: peerId, message }, "received peer ContactInfo");
 
     // Check if we already have this client
     const peerInfo = this.syncEngine.getContactInfoForPeerId(peerId.toString());
     if (peerInfo) {
-      log.info({ peerInfo }, "Already have this peer, skipping sync");
+      log.debug({ peerInfo }, "Already have this peer, skipping sync");
       return;
     } else {
       // If it is a new client, we do a sync against it
-      log.info({ peerInfo }, "New Peer Contact Info, syncing");
+      log.info({ peerInfo, connectedPeers: this.syncEngine.getPeerCount() }, "New Peer ContactInfo");
       this.syncEngine.addContactInfoForPeerId(peerId, message);
       const syncResult = await ResultAsync.fromPromise(
         this.syncEngine.diffSyncIfRequired(this, peerId.toString()),
         (e) => e,
       );
       if (syncResult.isErr()) {
-        log.error({ error: syncResult.error, peerId }, "failed to sync with new peer");
+        log.error({ error: syncResult.error, peerId }, "Failed to sync with new peer");
       }
     }
   }
@@ -931,11 +990,20 @@ export class Hub implements HubInterface {
 
     mergeResult.match(
       (eventId) => {
-        logMessage.debug(
-          `submitMessage success ${eventId}: fid ${message.data?.fid} merged ${messageTypeToName(
-            message.data?.type,
-          )} ${bytesToHexString(message.hash)._unsafeUnwrap()}`,
-        );
+        const logData = {
+          eventId,
+          fid: message.data?.fid,
+          type: messageTypeToName(message.data?.type),
+          hash: bytesToHexString(message.hash)._unsafeUnwrap(),
+          source,
+        };
+        const msg = "submitMessage success";
+
+        if (source === "sync") {
+          log.debug(logData, msg);
+        } else {
+          log.info(logData, msg);
+        }
       },
       (e) => {
         logMessage.warn({ errCode: e.errCode }, `submitMessage error: ${e.message}`);

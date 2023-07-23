@@ -96,24 +96,29 @@ class MerkleTrie {
 
     // Rebuild the trie by iterating over all the messages in the db
     const prefix = Buffer.from([RootPrefix.User]);
-    const iterator = this._db.iteratorByPrefix(prefix);
     let count = 0;
-    for await (const [key, value] of iterator) {
-      const postfix = (key as Buffer).readUint8(1 + FID_BYTES);
-      if (postfix < UserMessagePostfixMax) {
-        const message = Result.fromThrowable(
-          () => Message.decode(new Uint8Array(value as Buffer)),
-          (e) => e as HubError,
-        )();
-        if (message.isOk()) {
-          await this.insert(new SyncId(message.value));
-          count += 1;
-          if (count % 10_000 === 0) {
-            log.info({ count }, "Rebuilding Merkle Trie");
+
+    await this._db.forEachIteratorByPrefix(
+      prefix,
+      async (key, value) => {
+        const postfix = (key as Buffer).readUint8(1 + FID_BYTES);
+        if (postfix < UserMessagePostfixMax) {
+          const message = Result.fromThrowable(
+            () => Message.decode(new Uint8Array(value as Buffer)),
+            (e) => e as HubError,
+          )();
+          if (message.isOk()) {
+            await this.insert(new SyncId(message.value));
+            count += 1;
+            if (count % 10_000 === 0) {
+              log.info({ count }, "Rebuilding Merkle Trie");
+            }
           }
         }
-      }
-    }
+      },
+      {},
+      1 * 60 * 60 * 1000,
+    );
   }
 
   public async insert(id: SyncId): Promise<boolean> {
@@ -327,7 +332,11 @@ class MerkleTrie {
     // Fn that does the actual unloading
     const doUnload = async () => {
       this._callsSinceLastUnload = 0;
-      logger.info("Unloading trie from memory");
+
+      if (this._pendingDbUpdates.size === 0) {
+        // Trie has no pending DB updates, skipping unload
+        return;
+      }
 
       const txn = this._db.transaction();
 
@@ -341,7 +350,7 @@ class MerkleTrie {
       }
 
       await this._db.commit(txn);
-      logger.info({ numDbUpdates: this._pendingDbUpdates.size }, "Trie committed pending DB updates");
+      logger.info({ numDbUpdates: this._pendingDbUpdates.size, force }, "Trie committed pending DB updates");
 
       this._pendingDbUpdates.clear();
       this._root.unloadChildren();

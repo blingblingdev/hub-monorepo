@@ -45,3 +45,5 @@ dist
 .vscode
 .idea
 .fleet
+**/.vitepress/cache/
+**/.vitepress/dist/

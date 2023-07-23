@@ -9,7 +9,7 @@ import {
   NameRegistryEventType,
   toFarcasterTime,
 } from "@farcaster/hub-nodejs";
-import { createPublicClient, http, Log, PublicClient } from "viem";
+import { createPublicClient, fallback, http, Log, PublicClient } from "viem";
 import { goerli } from "viem/chains";
 import { err, ok, Result, ResultAsync } from "neverthrow";
 import { IdRegistry, NameRegistry } from "./abis.js";
@@ -27,7 +27,7 @@ export class GoerliEthConstants {
   public static IdRegistryAddress = "0xda107a1caf36d198b12c16c7b6a1d1c795978c42" as const;
   public static NameRegistryAddress = "0xe3be01d99baa8db9905b33a3ca391238234b79d1" as const;
   public static FirstBlock = 7648795;
-  public static ChunkSize = 10000;
+  public static ChunkSize = 1000;
 }
 
 type NameRegistryRenewEvent = Omit<NameRegistryEvent, "to" | "from">;
@@ -62,10 +62,11 @@ export class EthEventsProvider {
   private _isHistoricalSyncDone = false;
 
   // Number of blocks to wait before processing an event. This is hardcoded to
-  // 6 for now, because that's the threshold beyond which blocks are unlikely
-  // to reorg anymore. 6 blocks represents ~72 seconds on Goerli, so the delay
-  // is not too long.
-  static numConfirmations = 6;
+  // 3 for now, since we're on testnet and we want to recognize user
+  // registration events as quickly as possible without introducing too much
+  // risk due to block reorganization.
+  // Once we move registration to an L2 this will be less of a concern.
+  static numConfirmations = 3;
 
   // Events are only processed after 6 blocks have been confirmed; poll less
   // frequently while ensuring events are available the moment they are
@@ -163,15 +164,19 @@ export class EthEventsProvider {
   public static build(
     hub: HubInterface,
     ethRpcUrl: string,
+    rankRpcs: boolean,
     idRegistryAddress: `0x${string}`,
     nameRegistryAddress: `0x${string}`,
     firstBlock: number,
     chunkSize: number,
     resyncEvents: boolean,
   ): EthEventsProvider {
+    const ethRpcUrls = ethRpcUrl.split(",");
+    const transports = ethRpcUrls.map((url) => http(url, { retryCount: 5 }));
+
     const publicClient = createPublicClient({
       chain: goerli,
-      transport: http(ethRpcUrl, { retryCount: 5 }),
+      transport: fallback(transports, { rank: rankRpcs }),
     });
 
     const provider = new EthEventsProvider(

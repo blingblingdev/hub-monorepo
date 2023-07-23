@@ -60,12 +60,26 @@ type PeerContact = {
   peerId: PeerId;
 };
 
-type MergeResult = {
+class MergeResult {
   total: number;
   successCount: number;
   deferredCount: number;
   errCount: number;
-};
+
+  constructor(total = 0, successCount = 0, deferredCount = 0, errCount = 0) {
+    this.total = total;
+    this.successCount = successCount;
+    this.deferredCount = deferredCount;
+    this.errCount = errCount;
+  }
+
+  addResult(result: MergeResult) {
+    this.total += result.total;
+    this.successCount += result.successCount;
+    this.deferredCount += result.deferredCount;
+    this.errCount += result.errCount;
+  }
+}
 
 type SyncStatus = {
   isSyncing: boolean;
@@ -107,6 +121,8 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
   // Number of messages since last compaction
   private _messagesSinceLastCompaction = 0;
   private _isCompacting = false;
+
+  private _fidRetryMessageQ = new Map<number, Message[]>();
 
   constructor(
     hub: HubInterface,
@@ -221,6 +237,10 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     return this._isSyncing;
   }
 
+  public getPeerCount(): number {
+    return this.currentHubPeerContacts.size;
+  }
+
   public getContactInfoForPeerId(peerId: string): PeerContact | undefined {
     return this.currentHubPeerContacts.get(peerId);
   }
@@ -239,7 +259,6 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
 
   public async diffSyncIfRequired(hub: Hub, peerIdString?: string) {
     this.emit("syncStart");
-    log.info({ peerIdString }, "Diffsync: Starting diff sync");
 
     if (this.currentHubPeerContacts.size === 0) {
       log.warn("Diffsync: No peer contacts, skipping sync");
@@ -273,8 +292,6 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
       log.warn({ peerContact, peerId }, "Diffsync: No contact info for peer, skipping sync");
       this.emit("syncComplete", false);
       return;
-    } else {
-      log.info({ peerId, peerContact }, "Diffsync: Starting diff sync with peer");
     }
 
     const updatedPeerIdString = peerId.toString();
@@ -333,18 +350,20 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
           divergenceSeconds: syncStatus.divergenceSecondsAgo,
           lastBadSync: syncStatus.lastBadSync,
         },
-        "SyncStatus", // Search for this string in the logs to get summary of sync status
+        "DiffSync: SyncStatus", // Search for this string in the logs to get summary of sync status
       );
 
       if (syncStatus.shouldSync === true) {
-        log.info({ peerId }, "Diffsync: Syncing with peer");
-        await this.performSync(updatedPeerIdString, peerState, rpcClient);
+        log.info({ peerId }, "Diffsync: Starting Sync with peer");
+        const start = Date.now();
 
-        log.info({ peerId }, "Diffsync: complete");
+        const result = await this.performSync(updatedPeerIdString, peerState, rpcClient);
+
+        log.info({ peerId, result, timeTakenMs: Date.now() - start }, "Diffsync: complete");
         this.emit("syncComplete", true);
         return;
       } else {
-        log.info({ peerId }, "No need to sync");
+        log.info({ peerId }, "DiffSync: No need to sync");
         this.emit("syncComplete", false);
         return;
       }
@@ -420,17 +439,20 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     });
   }
 
-  async performSync(peerId: string, otherSnapshot: TrieSnapshot, rpcClient: HubRpcClient): Promise<boolean> {
-    log.info("Perform sync: Start");
+  async performSync(peerId: string, otherSnapshot: TrieSnapshot, rpcClient: HubRpcClient): Promise<MergeResult> {
+    log.debug({ peerId }, "Perform sync: Start");
 
-    let success = false;
+    const fullSyncResult = new MergeResult();
+
     try {
       this._isSyncing = true;
+      this._interruptSync = false;
+      this._fidRetryMessageQ = new Map();
 
       // Get the snapshot of our trie, at the same prefix as the peer's snapshot
       const snapshot = await this.getSnapshot(otherSnapshot.prefix);
       if (snapshot.isErr()) {
-        log.warn({ errCode: snapshot.error.errCode }, `Error performing sync: ${snapshot.error.message}}`);
+        log.warn({ errCode: snapshot.error.errCode, errorMessage: snapshot.error.message }, "Perform sync: Error");
       } else {
         const ourSnapshot = snapshot.value;
 
@@ -438,20 +460,18 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
         log.info(
           {
             divergencePrefix: Buffer.from(divergencePrefix).toString("ascii"),
+            divergencePrefixBuffer: divergencePrefix,
             prefix: Buffer.from(ourSnapshot.prefix).toString("ascii"),
+            prefixBuffer: ourSnapshot.prefix,
           },
           "Divergence prefix",
         );
 
-        const fullSyncResult: MergeResult = { total: 0, successCount: 0, deferredCount: 0, errCount: 0 };
         await this.fetchMissingHashesByPrefix(divergencePrefix, rpcClient, async (missingIds: Uint8Array[]) => {
-          fullSyncResult.total += missingIds.length;
           const result = await this.fetchAndMergeMessages(missingIds, rpcClient);
-          fullSyncResult.successCount += result.successCount;
-          fullSyncResult.deferredCount += result.deferredCount;
-          fullSyncResult.errCount += result.errCount;
+          fullSyncResult.addResult(result);
         });
-        log.info({ syncResult: fullSyncResult }, "Fetched missing hashes");
+        log.info({ syncResult: fullSyncResult }, "Perform sync: Sync Complete");
 
         // If we did not merge any messages and didn't defer any. Then this peer only had old messages.
         if (
@@ -459,20 +479,20 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
           fullSyncResult.successCount === 0 &&
           fullSyncResult.deferredCount === 0
         ) {
-          log.warn("No messages were successfully fetched");
+          log.warn(
+            { peerId },
+            "Perform sync: No messages were successfully fetched. Peer will be blocked for a while.",
+          );
           this._unproductivePeers.set(peerId, new Date());
         }
-
-        log.info("Sync complete");
-        success = true;
       }
     } catch (e) {
-      log.warn(e, "Error performing sync");
+      log.warn(e, "Perform sync: Error");
     } finally {
       this._isSyncing = false;
     }
 
-    return success;
+    return fullSyncResult;
   }
 
   async getAllMessagesBySyncIds(syncIds: Uint8Array[]): HubAsyncResult<Message[]> {
@@ -500,12 +520,11 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
   }
 
   public async fetchAndMergeMessages(syncIds: Uint8Array[], rpcClient: HubRpcClient): Promise<MergeResult> {
-    const empty = { successCount: 0, deferredCount: 0, errCount: 0, total: 0 };
     if (syncIds.length === 0) {
-      return empty;
+      return new MergeResult(); // empty merge result
     }
 
-    let result = empty;
+    let result = new MergeResult();
     const messagesResult = await rpcClient.getAllMessagesBySyncIds(
       SyncIds.create({ syncIds }),
       new Metadata(),
@@ -543,11 +562,18 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
         if (result.error.errCode === "bad_request.validation_failure") {
           if (result.error.message.startsWith("invalid signer")) {
             // The user's signer was not found. So fetch all signers from the peer and retry.
-            log.warn(
-              { fid: msg.data?.fid, err: result.error.message, signer: bytesToHexString(msg.signer)._unsafeUnwrap() },
-              "Invalid signer error, fetching all signers from peer",
-            );
             const retryResult = await this.syncUserAndRetryMessage(msg, rpcClient);
+            const retryResultErrorMessage = retryResult.isErr() ? retryResult.error.message : "";
+            log.warn(
+              {
+                fid: msg.data?.fid,
+                err: result.error.message,
+                signer: bytesToHexString(msg.signer)._unsafeUnwrap(),
+                retryResult: { ...retryResult, retryResultErrorMessage },
+              },
+              "Unknown signer, fetched all signers from peer",
+            );
+
             mergeResults.push(retryResult);
           } else if (result.error.message.startsWith("unknown fid")) {
             // We've missed this user's ID registry event? This is somewhat unlikely, but possible
@@ -585,19 +611,13 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     }
 
     const successCount = mergeResults.filter((r) => r.isOk()).length;
+    const result = new MergeResult(mergeResults.length, successCount, deferredCount, errCount);
+
     if (mergeResults.length > 0) {
-      log.info(
-        {
-          total: mergeResults.length,
-          success: successCount,
-          deferred: deferredCount,
-          errored: errCount,
-        },
-        "Merged messages during sync",
-      );
+      log.info(result, "Merged messages during sync");
     }
 
-    return { total: mergeResults.length, successCount, deferredCount, errCount };
+    return result;
   }
 
   async fetchMissingHashesByPrefix(
@@ -652,7 +672,7 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
 
     let fetchMessagesThreshold = HASHES_PER_FETCH;
     // If we have more messages but the hashes still mismatch, we need to find the exact message that's missing.
-    if (ourNode && ourNode.numMessages >= theirNode.numMessages) {
+    if (ourNode && ourNode.numMessages >= 1) {
       fetchMessagesThreshold = 1;
     }
 
@@ -758,19 +778,21 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     let numFids = 0;
     let numFnames = 0;
 
-    for await (const [,] of this._db.iteratorByPrefix(Buffer.from([RootPrefix.IdRegistryEvent]), {
-      keys: false,
-      values: false,
-    })) {
-      numFids += 1;
-    }
+    await this._db.forEachIteratorByPrefix(
+      Buffer.from([RootPrefix.IdRegistryEvent]),
+      () => {
+        numFids += 1;
+      },
+      { keys: false, values: false },
+    );
 
-    for await (const [,] of this._db.iteratorByPrefix(Buffer.from([RootPrefix.NameRegistryEvent]), {
-      keys: false,
-      values: false,
-    })) {
-      numFnames += 1;
-    }
+    await this._db.forEachIteratorByPrefix(
+      Buffer.from([RootPrefix.NameRegistryEvent]),
+      () => {
+        numFnames += 1;
+      },
+      { keys: false, values: false },
+    );
 
     return {
       numMessages: await this._trie.items(),
@@ -853,6 +875,20 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
       return err(new HubError("bad_request.invalid_param", "Invalid fid while retrying message"));
     }
 
+    if (this._fidRetryMessageQ.has(fid)) {
+      // If the queue is empty, this fid has already been retried, so we can skip
+      if (this._fidRetryMessageQ.get(fid)?.length === 0) {
+        return err(new HubError("bad_request.invalid_param", "Fid already retried"));
+      }
+
+      // Add the message to the queue
+      this._fidRetryMessageQ.get(fid)?.push(message);
+      return ok(this._fidRetryMessageQ.get(fid)?.length ?? 0);
+    } else {
+      // Create a new queue for this fid
+      this._fidRetryMessageQ.set(fid, [message]);
+    }
+
     // Probably not required to fetch the signer messages, but doing it here means
     // sync will complete in one round (prevents messages failing to merge due to missed or out of
     // order signer message)
@@ -868,13 +904,23 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     const results = await Promise.all(
       signerMessagesResult.value.messages.map((message) => this._hub.submitMessage(message, "sync")),
     );
+
+    const messages = this._fidRetryMessageQ.get(fid) ?? [];
+    this._fidRetryMessageQ.set(fid, []);
+
     if (results.every((r) => r.isErr())) {
-      return err(new HubError("unavailable.storage_failure", "Failed to merge signer messages"));
+      return err(new HubError("unavailable.storage_failure", "Failed to merge any signer message"));
     } else {
-      // if at least one signer message was merged, retry the original message
-      return (await this._hub.submitMessage(message, "sync")).mapErr((e) => {
-        return new HubError("unavailable.storage_failure", e);
-      });
+      // if at least one signer message was merged, retry the messages in the queue
+      const results = await Promise.all(messages.map(async (message) => this._hub.submitMessage(message, "sync")));
+
+      // If any of the messages failed, return a hub error
+      const firstFailed = results.find((r) => r.isErr());
+      if (firstFailed) {
+        return firstFailed;
+      } else {
+        return ok(0);
+      }
     }
   }
 }

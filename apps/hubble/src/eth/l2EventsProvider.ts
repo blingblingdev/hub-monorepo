@@ -13,7 +13,7 @@ import { StorageRegistry } from "./abis.js";
 import { HubInterface } from "../hubble.js";
 import { logger } from "../utils/logger.js";
 import { optimismGoerli } from "viem/chains";
-import { createPublicClient, http, Log, PublicClient } from "viem";
+import { createPublicClient, fallback, http, Log, PublicClient } from "viem";
 import { WatchContractEvent } from "./watchContractEvent.js";
 import { WatchBlockNumber } from "./watchBlockNumber.js";
 
@@ -24,7 +24,7 @@ const log = logger.child({
 export class OPGoerliEthConstants {
   public static StorageRegistryAddress = "0xa89cC9427335da6E8138517419FCB3c9c37d1604" as const;
   public static FirstBlock = 11183461;
-  public static ChunkSize = 10000;
+  public static ChunkSize = 1000;
   public static chainId = BigInt(420); // OP Goerli
 }
 
@@ -179,14 +179,18 @@ export class L2EventsProvider {
   public static build(
     hub: HubInterface,
     l2RpcUrl: string,
+    rankRpcs: boolean,
     storageRegistryAddress: `0x${string}`,
     firstBlock: number,
     chunkSize: number,
     resyncEvents: boolean,
   ): L2EventsProvider {
+    const l2RpcUrls = l2RpcUrl.split(",");
+    const transports = l2RpcUrls.map((url) => http(url, { retryCount: 10 }));
+
     const publicClient = createPublicClient({
       chain: optimismGoerli,
-      transport: http(l2RpcUrl, { retryCount: 10 }),
+      transport: fallback(transports, { rank: rankRpcs }),
     });
 
     const provider = new L2EventsProvider(
