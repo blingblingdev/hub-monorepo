@@ -30,13 +30,14 @@ import { GOSSIP_PROTOCOL_VERSION, msgIdFnStrictSign } from "./protocol.js";
 import { GossipMetricsRecorder } from "./gossipMetricsRecorder.js";
 import RocksDB from "storage/db/rocksdb.js";
 import { AddrInfo } from "@chainsafe/libp2p-gossipsub/types";
+import { PeerScoreThresholds } from "@chainsafe/libp2p-gossipsub/score";
 
 const MultiaddrLocalHost = "/ip4/127.0.0.1";
 
 /** The maximum number of pending merge messages before we drop new incoming gossip or sync messages. */
 export const MAX_MESSAGE_QUEUE_SIZE = 100_000;
 
-const log = logger.child({ component: "Node" });
+const log = logger.child({ component: "GossipNode" });
 
 /** Events emitted by a Farcaster Gossip Node */
 interface NodeEvents {
@@ -60,8 +61,12 @@ interface NodeOptions {
   gossipPort?: number | undefined;
   /** A list of PeerIds that are allowed to connect to this node */
   allowedPeerIdStrs?: string[] | undefined;
+  /** A list of peerIds that are not allowed to connect to this node */
+  deniedPeerIdStrs?: string[] | undefined;
   /** A list of addresses the node directly peers with, provided in MultiAddr format */
   directPeers?: AddrInfo[] | undefined;
+  /** Override peer scoring. Useful for tests */
+  scoreThresholds?: Partial<PeerScoreThresholds>;
 }
 
 /**
@@ -155,6 +160,14 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
       }
     }
     return this._node?.peerStore.get(peerId);
+  }
+
+  async isPeerAllowed(peerId: PeerId) {
+    if (this._connectionGater) {
+      return await this._connectionGater.filterMultiaddrForPeer(peerId);
+    } else {
+      return true;
+    }
   }
 
   /** Returns the GossipSub instance used by the Node */
@@ -393,6 +406,10 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
     this._connectionGater?.updateAllowedPeers(peerIds);
   }
 
+  updateDeniedPeerIds(peerIds: string[]) {
+    this._connectionGater?.updateDeniedPeers(peerIds);
+  }
+
   //TODO: Needs better typesafety
   static encodeMessage(message: GossipMessage): HubResult<Uint8Array> {
     return ok(GossipMessage.encode(message).finish());
@@ -420,6 +437,8 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
 
   /* Attempts to dial all the addresses in the bootstrap list */
   public async bootstrap(bootstrapAddrs: Multiaddr[]): Promise<HubResult<void>> {
+    log.info({ bootstrapAddrs }, "Bootstrapping Gossip Node");
+
     if (bootstrapAddrs.length === 0) return ok(undefined);
     const results = await Promise.all(bootstrapAddrs.map((addr) => this.connectAddress(addr)));
 
@@ -445,9 +464,9 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
       const protocolMessage = GossipNode.decodeMessage(message.data);
       if (protocolMessage.isOk() && protocolMessage.value.version === GossipVersion.V1_1) {
         if (protocolMessage.value.message !== undefined)
-          return protocolMessage._unsafeUnwrap().message?.hash as Uint8Array;
+          return protocolMessage.unwrapOr(undefined)?.message?.hash ?? new Uint8Array();
         if (protocolMessage.value.idRegistryEvent !== undefined)
-          return protocolMessage.value.idRegistryEvent?.transactionHash as Uint8Array;
+          return protocolMessage.value.idRegistryEvent?.transactionHash ?? new Uint8Array();
       }
     }
     return msgIdFnStrictSign(message);
@@ -481,15 +500,27 @@ export class GossipNode extends TypedEmitter<NodeEvents> {
       globalSignaturePolicy: "StrictSign",
       msgIdFn: this.getMessageId.bind(this),
       directPeers: options.directPeers || [],
+      canRelayMessage: true,
+      scoreThresholds: { ...options.scoreThresholds },
     });
 
     if (options.allowedPeerIdStrs) {
       log.info(
-        { identity: this.identity, function: "createNode", allowedPeerIds: options.allowedPeerIdStrs },
+        {
+          identity: this.identity,
+          function: "createNode",
+          allowedPeerIds: options.allowedPeerIdStrs,
+          deniedPeerIds: options.deniedPeerIdStrs,
+        },
         "!!! PEER-ID RESTRICTIONS ENABLED !!!",
       );
+    } else {
+      log.warn(
+        { identity: this.identity, deniedPeerIds: options.deniedPeerIdStrs, function: "createNode" },
+        "No PEER-ID RESTRICTIONS ENABLED. This node will accept connections from any peer",
+      );
     }
-    this._connectionGater = new ConnectionFilter(options.allowedPeerIdStrs);
+    this._connectionGater = new ConnectionFilter(options.allowedPeerIdStrs, options.deniedPeerIdStrs);
 
     return ResultAsync.fromPromise(
       createLibp2p({

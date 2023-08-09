@@ -32,6 +32,7 @@ import {
   isVerificationRemoveMessage,
   getSSLHubRpcClient,
   getInsecureHubRpcClient,
+  Embed,
 } from "@farcaster/hub-nodejs";
 import { HubSubscriber } from "./hubSubscriber";
 import { Logger } from "pino";
@@ -407,7 +408,10 @@ export class HubReplicator {
           parentHash: message.data.castAddBody.parentCastId?.hash,
           parentFid: message.data.castAddBody.parentCastId?.fid,
           parentUrl: message.data.castAddBody.parentUrl,
-          embeds: message.data.castAddBody.embedsDeprecated,
+          embeds:
+            message.data.castAddBody.embeds ||
+            message.data.castAddBody.embedsDeprecated?.map((x) => Embed.create({ url: x })) ||
+            [],
           mentions: message.data.castAddBody.mentions,
           mentionsPositions: message.data.castAddBody.mentionsPositions,
         })),
@@ -630,6 +634,19 @@ export class HubReplicator {
           fid: message.data.fid,
           displayTimestamp: farcasterTimeToDate(message.data.linkBody.displayTimestamp),
         })),
+      )
+      // Do nothing on conflict since nothing should have changed if hash is the same.
+      .onConflict((oc) =>
+        oc
+          .columns(["fid", "targetFid", "type"])
+          .doUpdateSet(({ ref }) => ({
+            updatedAt: new Date(),
+            deletedAt: null,
+            hash: ref("excluded.hash"),
+            timestamp: ref("excluded.timestamp"),
+            displayTimestamp: ref("excluded.displayTimestamp"),
+          }))
+          .where(({ cmpr, ref }) => cmpr("links.timestamp", "<", ref("excluded.timestamp"))),
       )
       .execute();
 

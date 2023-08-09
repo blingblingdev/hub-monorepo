@@ -2,6 +2,7 @@ import {
   CastAddMessage,
   CastId,
   CastRemoveMessage,
+  DbStats,
   FidsResponse,
   getServer,
   HubAsyncResult,
@@ -26,19 +27,21 @@ import {
   SignerAddMessage,
   SignerRemoveMessage,
   status,
+  StorageLimitsResponse,
   SyncIds,
-  DbStats,
+  SyncStatus,
+  SyncStatusResponse,
   TrieNodeMetadataResponse,
   TrieNodeSnapshotResponse,
   UserDataAddMessage,
   VerificationAddEthAddressMessage,
   VerificationRemoveMessage,
-  SyncStatusResponse,
-  SyncStatus,
   UserNameProof,
   UsernameProofsResponse,
+  OnChainEventResponse,
+  SignerOnChainEvent,
 } from "@farcaster/hub-nodejs";
-import { err, ok, Result, ResultAsync } from "neverthrow";
+import { err, ok, Result } from "neverthrow";
 import { APP_NICKNAME, APP_VERSION, HubInterface } from "../hubble.js";
 import { GossipNode } from "../network/p2p/gossipNode.js";
 import { NodeMetadata } from "../network/sync/merkleTrie.js";
@@ -46,33 +49,24 @@ import SyncEngine from "../network/sync/syncEngine.js";
 import Engine from "../storage/engine/index.js";
 import { MessagesPage } from "../storage/stores/types.js";
 import { logger } from "../utils/logger.js";
-import { addressInfoFromParts } from "../utils/p2p.js";
-import { RateLimiterAbstract, RateLimiterMemory } from "rate-limiter-flexible";
+import { addressInfoFromParts, extractIPAddress } from "../utils/p2p.js";
+import { RateLimiterMemory } from "rate-limiter-flexible";
 import {
   BufferedStreamWriter,
   STREAM_MESSAGE_BUFFER_SIZE,
   SLOW_CLIENT_GRACE_PERIOD_MS,
 } from "./bufferedStreamWriter.js";
 import { sleep } from "../utils/crypto.js";
-import { RentRegistryEventsResponse } from "@farcaster/hub-nodejs";
+import { SUBMIT_MESSAGE_RATE_LIMIT, rateLimitByIp } from "../utils/rateLimits.js";
 
 const HUBEVENTS_READER_TIMEOUT = 1 * 60 * 60 * 1000; // 1 hour
+
+export const SUBSCRIBE_PERIP_LIMIT = 4; // Max 4 subscriptions per IP
+export const SUBSCRIBE_GLOBAL_LIMIT = 4096; // Max 4096 subscriptions globally
 
 export type RpcUsers = Map<string, string[]>;
 
 const log = logger.child({ component: "rpcServer" });
-
-export const rateLimitByIp = async (ip: string, limiter: RateLimiterAbstract): HubAsyncResult<boolean> => {
-  // Get the IP part of the address
-  const ipPart = ip.split(":")[0] ?? "";
-
-  try {
-    await limiter.consume(ipPart);
-    return ok(true);
-  } catch (e) {
-    return err(new HubError("unavailable", "Too many requests"));
-  }
-};
 
 // Check if the user is authenticated via the metadata
 export const authenticateUser = async (metadata: Metadata, rpcUsers: RpcUsers): HubAsyncResult<boolean> => {
@@ -174,6 +168,60 @@ export const getRPCUsersFromAuthString = (rpcAuth?: string): Map<string, string[
   return rpcUsers;
 };
 
+/**
+ * Limit the number of simultaneous connections to the RPC server by
+ * a single IP address.
+ */
+class IpConnectionLimiter {
+  private perIpLimit: number;
+  private globalLimit: number;
+
+  private ipConnections: Map<string, number>;
+  private totalConnections: number;
+
+  constructor(perIpLimit: number, globalLimit: number) {
+    this.ipConnections = new Map();
+
+    this.perIpLimit = perIpLimit;
+    this.globalLimit = globalLimit;
+    this.totalConnections = 0;
+  }
+
+  public addConnection(peerString: string): Result<boolean, Error> {
+    // Get the IP part of the address
+    const ip = extractIPAddress(peerString) ?? "unknown";
+
+    const connections = this.ipConnections.get(ip) ?? 0;
+    if (connections >= this.perIpLimit) {
+      return err(new Error(`Too many connections from this IP: ${ip}`));
+    }
+
+    if (this.totalConnections >= this.globalLimit) {
+      return err(new Error("Too many connections to this server"));
+    }
+
+    this.ipConnections.set(ip, connections + 1);
+    this.totalConnections += 1;
+    return ok(true);
+  }
+
+  public removeConnection(peerString: string) {
+    // Get the IP part of the address
+    const ip = extractIPAddress(peerString) ?? "unknown";
+
+    const connections = this.ipConnections.get(ip) ?? 0;
+    if (connections > 0) {
+      this.ipConnections.set(ip, connections - 1);
+      this.totalConnections -= 1;
+    }
+  }
+
+  clear() {
+    this.ipConnections.clear();
+    this.totalConnections = 0;
+  }
+}
+
 export default class Server {
   private hub: HubInterface | undefined;
   private engine: Engine | undefined;
@@ -188,6 +236,7 @@ export default class Server {
 
   private rpcUsers: RpcUsers;
   private submitMessageRateLimiter: RateLimiterMemory;
+  private subscribeIpLimiter = new IpConnectionLimiter(SUBSCRIBE_PERIP_LIMIT, SUBSCRIBE_GLOBAL_LIMIT);
 
   constructor(
     hub?: HubInterface,
@@ -216,15 +265,13 @@ export default class Server {
     this.grpcServer.addService(HubServiceService, this.getImpl());
 
     // Submit message are rate limited by default to 20k per minute
-    let rateLimitPerMinute = 20_000;
+    const rateLimitPerMinute = SUBMIT_MESSAGE_RATE_LIMIT;
     if (rpcRateLimit !== undefined && rpcRateLimit >= 0) {
-      rateLimitPerMinute = rpcRateLimit;
+      rateLimitPerMinute.points = rpcRateLimit;
     }
+    log.info({ rpcRateLimit }, "RPC rate limit enabled");
 
-    this.submitMessageRateLimiter = new RateLimiterMemory({
-      points: rateLimitPerMinute,
-      duration: 60,
-    });
+    this.submitMessageRateLimiter = new RateLimiterMemory(rateLimitPerMinute);
   }
 
   async start(ip = "0.0.0.0", port = 0): Promise<number> {
@@ -283,10 +330,17 @@ export default class Server {
     return this.incomingConnections > 0;
   }
 
+  public clearRateLimiters() {
+    this.subscribeIpLimiter.clear();
+  }
+
   getImpl = (): HubServiceServer => {
     return {
       getInfo: (call, callback) => {
         (async () => {
+          const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+          log.debug({ method: "getInfo", req: call.request }, `RPC call from ${peer}`);
+
           const info = HubInfoResponse.create({
             version: APP_VERSION,
             isSyncing: !this.syncEngine?.isSyncing(),
@@ -308,6 +362,9 @@ export default class Server {
       },
       getSyncStatus: (call, callback) => {
         (async () => {
+          const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+          log.debug({ method: "getSyncStatus", req: call.request }, `RPC call from ${peer}`);
+
           if (!this.gossipNode || !this.syncEngine || !this.hub) {
             callback(toServiceError(new HubError("bad_request", "Hub isn't initialized")));
             return;
@@ -322,6 +379,7 @@ export default class Server {
           const response = SyncStatusResponse.create({
             isSyncing: false,
             syncStatus: [],
+            engineStarted: this.syncEngine.isStarted(),
           });
 
           for (const peerId of peersToCheck) {
@@ -347,6 +405,9 @@ export default class Server {
         })();
       },
       getAllSyncIdsByPrefix: (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getAllSyncIdsByPrefix", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         (async () => {
@@ -355,6 +416,9 @@ export default class Server {
         })();
       },
       getAllMessagesBySyncIds: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getAllMessagesBySyncIds", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const messagesResult = await this.syncEngine?.getAllMessagesBySyncIds(request.syncIds);
@@ -382,6 +446,9 @@ export default class Server {
         );
       },
       getSyncMetadataByPrefix: (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getSyncMetadataByPrefix", req: call.request }, `RPC call from ${peer}`);
+
         const toTrieNodeMetadataResponse = (metadata?: NodeMetadata): TrieNodeMetadataResponse => {
           const childrenTrie = [];
 
@@ -420,6 +487,9 @@ export default class Server {
         })();
       },
       getSyncSnapshotByPrefix: (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getSyncSnapshotByPrefix", req: call.request }, `RPC call from ${peer}`);
+
         // If someone is asking for our sync snapshot, that means we're getting incoming
         // connections
         this.incomingConnections += 1;
@@ -447,16 +517,10 @@ export default class Server {
       },
       submitMessage: async (call, callback) => {
         // Identify peer that is calling, if available. This is used for rate limiting.
-        let peer;
-        const peerResult = Result.fromThrowable(
+        const peer = Result.fromThrowable(
           () => call.getPeer(),
           (e) => e,
-        )();
-        if (peerResult.isErr()) {
-          peer = "unavailable"; // Catchall. If peer is unavailable, we will group all of them into one bucket
-        } else {
-          peer = peerResult.value;
-        }
+        )().unwrapOr("unavailable");
 
         // Check for rate limits
         const rateLimitResult = await rateLimitByIp(peer, this.submitMessageRateLimiter);
@@ -488,6 +552,9 @@ export default class Server {
         );
       },
       getCast: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getCast", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const castAddResult = await this.engine?.getCast(request.fid, request.hash);
@@ -501,6 +568,9 @@ export default class Server {
         );
       },
       getCastsByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getCastsByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
 
         const castsResult = await this.engine?.getCastsByFid(fid, {
@@ -518,6 +588,9 @@ export default class Server {
         );
       },
       getCastsByParent: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getCastsByParent", req: call.request }, `RPC call from ${peer}`);
+
         const { parentCastId, parentUrl, pageSize, pageToken, reverse } = call.request;
 
         const castsResult = await this.engine?.getCastsByParent(parentCastId ?? parentUrl ?? "", {
@@ -535,6 +608,9 @@ export default class Server {
         );
       },
       getCastsByMention: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getCastsByMention", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
 
         const castsResult = await this.engine?.getCastsByMention(fid, { pageSize, pageToken, reverse });
@@ -548,6 +624,9 @@ export default class Server {
         );
       },
       getReaction: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getReaction", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const reactionResult = await this.engine?.getReaction(
@@ -565,6 +644,9 @@ export default class Server {
         );
       },
       getReactionsByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getReactionsByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, reactionType, pageSize, pageToken, reverse } = call.request;
         const reactionsResult = await this.engine?.getReactionsByFid(fid, reactionType, {
           pageSize,
@@ -581,6 +663,9 @@ export default class Server {
         );
       },
       getReactionsByCast: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getReactionsByCast", req: call.request }, `RPC call from ${peer}`);
+
         const { targetCastId, reactionType, pageSize, pageToken, reverse } = call.request;
         const reactionsResult = await this.engine?.getReactionsByTarget(targetCastId ?? CastId.create(), reactionType, {
           pageSize,
@@ -597,6 +682,9 @@ export default class Server {
         );
       },
       getReactionsByTarget: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getReactionsByTarget", req: call.request }, `RPC call from ${peer}`);
+
         const { targetCastId, targetUrl, reactionType, pageSize, pageToken, reverse } = call.request;
         const reactionsResult = await this.engine?.getReactionsByTarget(targetCastId ?? targetUrl ?? "", reactionType, {
           pageSize,
@@ -613,6 +701,9 @@ export default class Server {
         );
       },
       getUserData: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getUserData", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const userDataResult = await this.engine?.getUserData(request.fid, request.userDataType);
@@ -626,6 +717,9 @@ export default class Server {
         );
       },
       getUserDataByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getUserDataByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
 
         const userDataResult = await this.engine?.getUserDataByFid(fid, {
@@ -643,6 +737,9 @@ export default class Server {
         );
       },
       getNameRegistryEvent: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getNameRegistryEvent", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const nameRegistryEventResult = await this.engine?.getNameRegistryEvent(request.name);
@@ -656,6 +753,9 @@ export default class Server {
         );
       },
       getUsernameProof: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getUsernameProof", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const usernameProofResult = await this.engine?.getUserNameProof(request.name);
@@ -669,6 +769,9 @@ export default class Server {
         );
       },
       getUserNameProofsByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getUserNameProofsByFid", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const usernameProofResult = await this.engine?.getUserNameProofsByFid(request.fid);
@@ -682,6 +785,9 @@ export default class Server {
         );
       },
       getVerification: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getVerification", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const verificationResult = await this.engine?.getVerification(request.fid, request.address);
@@ -695,6 +801,9 @@ export default class Server {
         );
       },
       getVerificationsByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getVerificationsByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
 
         const verificationsResult = await this.engine?.getVerificationsByFid(fid, {
@@ -712,6 +821,9 @@ export default class Server {
         );
       },
       getSigner: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getSigner", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const signerResult = await this.engine?.getSigner(request.fid, request.signer);
@@ -724,7 +836,26 @@ export default class Server {
           },
         );
       },
+      getOnChainSigner: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getOnChainSigner", req: call.request }, `RPC call from ${peer}`);
+
+        const request = call.request;
+
+        const signerResult = await this.engine?.getActiveSigner(request.fid, request.signer);
+        signerResult?.match(
+          (signer: SignerOnChainEvent) => {
+            callback(null, signer);
+          },
+          (err: HubError) => {
+            callback(toServiceError(err));
+          },
+        );
+      },
       getSignersByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getSignersByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
         const signersResult = await this.engine?.getSignersByFid(fid, {
           pageSize,
@@ -741,6 +872,9 @@ export default class Server {
         );
       },
       getIdRegistryEvent: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getIdRegistryEvent", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
         const idRegistryEventResult = await this.engine?.getIdRegistryEvent(request.fid);
         idRegistryEventResult?.match(
@@ -753,6 +887,9 @@ export default class Server {
         );
       },
       getLink: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getLink", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
 
         const linkResult = await this.engine?.getLink(request.fid, request.linkType, request.targetFid ?? 0);
@@ -766,6 +903,9 @@ export default class Server {
         );
       },
       getLinksByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getLinksByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, linkType, pageSize, pageToken, reverse } = call.request;
         const linksResult = await this.engine?.getLinksByFid(fid, linkType, {
           pageSize,
@@ -782,6 +922,9 @@ export default class Server {
         );
       },
       getLinksByTarget: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getLinksByTarget", req: call.request }, `RPC call from ${peer}`);
+
         const { targetFid, linkType, pageSize, pageToken, reverse } = call.request;
         const linksResult = await this.engine?.getLinksByTarget(targetFid ?? 0, linkType, {
           pageSize,
@@ -798,6 +941,9 @@ export default class Server {
         );
       },
       getIdRegistryEventByAddress: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getIdRegistryEventByAddress", req: call.request }, `RPC call from ${peer}`);
+
         const request = call.request;
         const idRegistryEventResult = await this.engine?.getIdRegistryEventByAddress(request.address);
         idRegistryEventResult?.match(
@@ -809,12 +955,24 @@ export default class Server {
           },
         );
       },
-      getRentRegistryEvents: async (call, callback) => {
+      getOnChainEvents: async (call, callback) => {
         const request = call.request;
-        const rentRegistryEventsResult = await this.engine?.getRentRegistryEvents(request.fid);
-        rentRegistryEventsResult?.match(
-          (rentRegistryEvents: RentRegistryEventsResponse) => {
-            callback(null, rentRegistryEvents);
+        const onChainEventsResult = await this.engine?.getOnChainEvents(request.eventType, request.fid);
+        onChainEventsResult?.match(
+          (onChainEvents: OnChainEventResponse) => {
+            callback(null, onChainEvents);
+          },
+          (err: HubError) => {
+            callback(toServiceError(err));
+          },
+        );
+      },
+      getCurrentStorageLimitsByFid: async (call, callback) => {
+        const request = call.request;
+        const storageLimitsResult = await this.engine?.getCurrentStorageLimitsByFid(request.fid);
+        storageLimitsResult?.match(
+          (storageLimits: StorageLimitsResponse) => {
+            callback(null, storageLimits);
           },
           (err: HubError) => {
             callback(toServiceError(err));
@@ -822,6 +980,9 @@ export default class Server {
         );
       },
       getFids: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getFids", req: call.request }, `RPC call from ${peer}`);
+
         const { pageSize, pageToken, reverse } = call.request;
 
         const result = await this.engine?.getFids({
@@ -839,6 +1000,9 @@ export default class Server {
         );
       },
       getAllCastMessagesByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getAllCastMessagesByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllCastMessagesByFid(fid, {
           pageSize,
@@ -855,6 +1019,9 @@ export default class Server {
         );
       },
       getAllReactionMessagesByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getAllReactionMessagesByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllReactionMessagesByFid(fid, {
           pageSize,
@@ -871,6 +1038,9 @@ export default class Server {
         );
       },
       getAllVerificationMessagesByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getAllVerificationMessagesByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllVerificationMessagesByFid(fid, {
           pageSize,
@@ -887,6 +1057,9 @@ export default class Server {
         );
       },
       getAllSignerMessagesByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getAllSignerMessagesByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllSignerMessagesByFid(fid, {
           pageSize,
@@ -903,6 +1076,9 @@ export default class Server {
         );
       },
       getAllUserDataMessagesByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getAllUserDataMessagesByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getUserDataByFid(fid, {
           pageSize,
@@ -919,6 +1095,9 @@ export default class Server {
         );
       },
       getAllLinkMessagesByFid: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getAllLinkMessagesByFid", req: call.request }, `RPC call from ${peer}`);
+
         const { fid, pageSize, pageToken, reverse } = call.request;
         const result = await this.engine?.getAllLinkMessagesByFid(fid, {
           pageSize,
@@ -935,6 +1114,9 @@ export default class Server {
         );
       },
       getEvent: async (call, callback) => {
+        const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+        log.debug({ method: "getEvent", req: call.request }, `RPC call from ${peer}`);
+
         const result = await this.engine?.getEvent(call.request.id);
         result?.match(
           (event: HubEvent) => callback(null, event),
@@ -943,8 +1125,29 @@ export default class Server {
       },
       subscribe: async (stream) => {
         const { request } = stream;
+        const peer = Result.fromThrowable(
+          () => stream.getPeer(),
+          (e) => {
+            log.error({ err: e }, "subscribe: error getting peer");
+          },
+        )().unwrapOr("unknown peer:port");
 
-        log.info({ request }, "subscribe: starting stream");
+        // Check if username/password authenticates. If it does, we'll allow the connection
+        // regardless of rate limits.
+        let authorized = false;
+        if (this.rpcUsers.size > 0) {
+          authorized = (await authenticateUser(stream.metadata, this.rpcUsers)).unwrapOr(false);
+        }
+        const allowed = this.subscribeIpLimiter.addConnection(peer);
+
+        if (allowed.isOk() || authorized) {
+          log.info({ r: request, peer }, "subscribe: starting stream");
+        } else {
+          log.info({ r: request, peer, err: allowed.error.message }, "subscribe: rejected stream");
+
+          stream.destroy(new Error(allowed.error.message));
+          return;
+        }
 
         // We'll write using a Buffered Stream Writer
         const bufferedStreamWriter = new BufferedStreamWriter(stream);
@@ -954,10 +1157,6 @@ export default class Server {
           bufferedStreamWriter.writeToStream(event);
         };
 
-        stream.on("cancelled", () => {
-          stream.destroy();
-        });
-
         // Register a close listener to remove all listeners before we start sending events
         stream.on("close", () => {
           this.engine?.eventHandler.off("mergeMessage", eventListener);
@@ -966,6 +1165,11 @@ export default class Server {
           this.engine?.eventHandler.off("mergeIdRegistryEvent", eventListener);
           this.engine?.eventHandler.off("mergeNameRegistryEvent", eventListener);
           this.engine?.eventHandler.off("mergeUsernameProofEvent", eventListener);
+          this.engine?.eventHandler.off("mergeOnChainEvent", eventListener);
+
+          this.subscribeIpLimiter.removeConnection(peer);
+
+          log.info({ peer }, "subscribe: stream closed");
         });
 
         // If the user wants to start from a specific event, we'll start from there first
@@ -1049,6 +1253,7 @@ export default class Server {
           this.engine?.eventHandler.on("mergeIdRegistryEvent", eventListener);
           this.engine?.eventHandler.on("mergeNameRegistryEvent", eventListener);
           this.engine?.eventHandler.on("mergeUsernameProofEvent", eventListener);
+          this.engine?.eventHandler.on("mergeOnChainEvent", eventListener);
         } else {
           for (const eventType of request.eventTypes) {
             if (eventType === HubEventType.MERGE_MESSAGE) {
@@ -1063,6 +1268,8 @@ export default class Server {
               this.engine?.eventHandler.on("mergeNameRegistryEvent", eventListener);
             } else if (eventType === HubEventType.MERGE_USERNAME_PROOF) {
               this.engine?.eventHandler.on("mergeUsernameProofEvent", eventListener);
+            } else if (eventType === HubEventType.MERGE_ON_CHAIN_EVENT) {
+              this.engine?.eventHandler.on("mergeOnChainEvent", eventListener);
             }
           }
         }

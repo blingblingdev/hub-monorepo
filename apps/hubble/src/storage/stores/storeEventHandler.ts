@@ -17,13 +17,14 @@ import {
   MergeUsernameProofHubEvent,
   PruneMessageHubEvent,
   RevokeMessageHubEvent,
-  MessageType,
+  MergeOnChainEventHubEvent,
+  isMergeOnChainHubEvent,
 } from "@farcaster/hub-nodejs";
 import AbstractRocksDB from "@farcaster/rocksdb";
 import AsyncLock from "async-lock";
 import { err, ok, ResultAsync } from "neverthrow";
 import { TypedEmitter } from "tiny-typed-emitter";
-import RocksDB, { Iterator, Transaction } from "../db/rocksdb.js";
+import RocksDB, { Transaction } from "../db/rocksdb.js";
 import { RootPrefix, UserMessagePostfix } from "../db/types.js";
 import { StorageCache } from "./storageCache.js";
 import { makeTsHash } from "../db/message.js";
@@ -42,6 +43,7 @@ import {
   VerificationAddEthAddressMessage,
   VerificationRemoveMessage,
 } from "@farcaster/core";
+import { logger } from "../../utils/logger.js";
 
 const PRUNE_TIME_LIMIT_DEFAULT = 60 * 60 * 24 * 3 * 1000; // 3 days in ms
 const DEFAULT_LOCK_MAX_PENDING = 1_000;
@@ -98,6 +100,12 @@ export type StoreEvents = {
    * is merged into the UserDataStore.
    */
   mergeUsernameProofEvent: (event: MergeUsernameProofHubEvent) => void;
+
+  /**
+   * mergeOnChainEvent is emitted when a on chain event is merged into the
+   * OnChainEventStore.
+   */
+  mergeOnChainEvent: (event: MergeOnChainEventHubEvent) => void;
 };
 
 export type HubEventArgs = Omit<HubEvent, "id">;
@@ -190,6 +198,17 @@ class StoreEventHandler extends TypedEmitter<StoreEvents> {
     this._storageCache = new StorageCache(this._db);
   }
 
+  async getCurrentStorageUnitsForFid(fid: number): HubAsyncResult<number> {
+    const units = await this._storageCache.getCurrentStorageUnitsForFid(fid);
+
+    if (units.isOk() && units.value === 0) {
+      logger.debug({ fid }, "fid has no registered storage, would be pruned");
+    }
+
+    // This is temporary, when all fids are migrated to using storage rent, we'll just use the units directly.
+    return units.map((u) => (u > 0 ? u : 1));
+  }
+
   async getCacheMessageCount(fid: number, set: UserMessagePostfix): HubAsyncResult<number> {
     return this._storageCache.getMessageCount(fid, set);
   }
@@ -254,12 +273,18 @@ class StoreEventHandler extends TypedEmitter<StoreEvents> {
       }
     }
 
+    const units = await this.getCurrentStorageUnitsForFid(message.data.fid);
+
+    if (units.isErr()) {
+      return err(units.error);
+    }
+
     const messageCount = await this.getCacheMessageCount(message.data.fid, set);
     if (messageCount.isErr()) {
       return err(messageCount.error);
     }
 
-    if (messageCount.value < sizeLimit) {
+    if (messageCount.value < sizeLimit * units.value) {
       return ok(false);
     }
 
@@ -340,6 +365,8 @@ class StoreEventHandler extends TypedEmitter<StoreEvents> {
       this.emit("mergeIdRegistryEvent", event);
     } else if (isMergeUsernameProofHubEvent(event)) {
       this.emit("mergeUsernameProofEvent", event);
+    } else if (isMergeOnChainHubEvent(event)) {
+      this.emit("mergeOnChainEvent", event);
     } else {
       return err(new HubError("bad_request.invalid_param", "invalid event type"));
     }

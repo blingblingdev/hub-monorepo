@@ -12,8 +12,61 @@ import {
   userDataTypeFromJSON,
   userDataTypeToJSON,
 } from "./message";
-import { RentRegistryEvent } from "./storage_event";
+import { OnChainEvent, OnChainEventType, onChainEventTypeFromJSON, onChainEventTypeToJSON } from "./onchain_event";
 import { UserNameProof } from "./username_proof";
+
+export enum StoreType {
+  NONE = 0,
+  CASTS = 1,
+  LINKS = 2,
+  REACTIONS = 3,
+  USER_DATA = 4,
+  VERIFICATIONS = 5,
+}
+
+export function storeTypeFromJSON(object: any): StoreType {
+  switch (object) {
+    case 0:
+    case "STORE_TYPE_NONE":
+      return StoreType.NONE;
+    case 1:
+    case "STORE_TYPE_CASTS":
+      return StoreType.CASTS;
+    case 2:
+    case "STORE_TYPE_LINKS":
+      return StoreType.LINKS;
+    case 3:
+    case "STORE_TYPE_REACTIONS":
+      return StoreType.REACTIONS;
+    case 4:
+    case "STORE_TYPE_USER_DATA":
+      return StoreType.USER_DATA;
+    case 5:
+    case "STORE_TYPE_VERIFICATIONS":
+      return StoreType.VERIFICATIONS;
+    default:
+      throw new tsProtoGlobalThis.Error("Unrecognized enum value " + object + " for enum StoreType");
+  }
+}
+
+export function storeTypeToJSON(object: StoreType): string {
+  switch (object) {
+    case StoreType.NONE:
+      return "STORE_TYPE_NONE";
+    case StoreType.CASTS:
+      return "STORE_TYPE_CASTS";
+    case StoreType.LINKS:
+      return "STORE_TYPE_LINKS";
+    case StoreType.REACTIONS:
+      return "STORE_TYPE_REACTIONS";
+    case StoreType.USER_DATA:
+      return "STORE_TYPE_USER_DATA";
+    case StoreType.VERIFICATIONS:
+      return "STORE_TYPE_VERIFICATIONS";
+    default:
+      throw new tsProtoGlobalThis.Error("Unrecognized enum value " + object + " for enum StoreType");
+  }
+}
 
 export interface Empty {
 }
@@ -156,12 +209,22 @@ export interface RentRegistryEventsRequest {
   fid: number;
 }
 
-export interface RentRegistryEventsResponse {
-  events: RentRegistryEvent[];
+export interface OnChainEventRequest {
+  fid: number;
+  eventType: OnChainEventType;
 }
 
-export interface StorageAdminRegistryEventRequest {
-  transactionHash: Uint8Array;
+export interface OnChainEventResponse {
+  events: OnChainEvent[];
+}
+
+export interface StorageLimitsResponse {
+  limits: StorageLimit[];
+}
+
+export interface StorageLimit {
+  storeType: StoreType;
+  limit: number;
 }
 
 export interface UsernameProofRequest {
@@ -2259,31 +2322,41 @@ export const RentRegistryEventsRequest = {
   },
 };
 
-function createBaseRentRegistryEventsResponse(): RentRegistryEventsResponse {
-  return { events: [] };
+function createBaseOnChainEventRequest(): OnChainEventRequest {
+  return { fid: 0, eventType: 0 };
 }
 
-export const RentRegistryEventsResponse = {
-  encode(message: RentRegistryEventsResponse, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
-    for (const v of message.events) {
-      RentRegistryEvent.encode(v!, writer.uint32(10).fork()).ldelim();
+export const OnChainEventRequest = {
+  encode(message: OnChainEventRequest, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    if (message.fid !== 0) {
+      writer.uint32(8).uint64(message.fid);
+    }
+    if (message.eventType !== 0) {
+      writer.uint32(16).int32(message.eventType);
     }
     return writer;
   },
 
-  decode(input: _m0.Reader | Uint8Array, length?: number): RentRegistryEventsResponse {
+  decode(input: _m0.Reader | Uint8Array, length?: number): OnChainEventRequest {
     const reader = input instanceof _m0.Reader ? input : _m0.Reader.create(input);
     let end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseRentRegistryEventsResponse();
+    const message = createBaseOnChainEventRequest();
     while (reader.pos < end) {
       const tag = reader.uint32();
       switch (tag >>> 3) {
         case 1:
-          if (tag != 10) {
+          if (tag != 8) {
             break;
           }
 
-          message.events.push(RentRegistryEvent.decode(reader, reader.uint32()));
+          message.fid = longToNumber(reader.uint64() as Long);
+          continue;
+        case 2:
+          if (tag != 16) {
+            break;
+          }
+
+          message.eventType = reader.int32() as any;
           continue;
       }
       if ((tag & 7) == 4 || tag == 0) {
@@ -2294,49 +2367,108 @@ export const RentRegistryEventsResponse = {
     return message;
   },
 
-  fromJSON(object: any): RentRegistryEventsResponse {
+  fromJSON(object: any): OnChainEventRequest {
     return {
-      events: Array.isArray(object?.events) ? object.events.map((e: any) => RentRegistryEvent.fromJSON(e)) : [],
+      fid: isSet(object.fid) ? Number(object.fid) : 0,
+      eventType: isSet(object.eventType) ? onChainEventTypeFromJSON(object.eventType) : 0,
     };
   },
 
-  toJSON(message: RentRegistryEventsResponse): unknown {
+  toJSON(message: OnChainEventRequest): unknown {
+    const obj: any = {};
+    message.fid !== undefined && (obj.fid = Math.round(message.fid));
+    message.eventType !== undefined && (obj.eventType = onChainEventTypeToJSON(message.eventType));
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OnChainEventRequest>, I>>(base?: I): OnChainEventRequest {
+    return OnChainEventRequest.fromPartial(base ?? {});
+  },
+
+  fromPartial<I extends Exact<DeepPartial<OnChainEventRequest>, I>>(object: I): OnChainEventRequest {
+    const message = createBaseOnChainEventRequest();
+    message.fid = object.fid ?? 0;
+    message.eventType = object.eventType ?? 0;
+    return message;
+  },
+};
+
+function createBaseOnChainEventResponse(): OnChainEventResponse {
+  return { events: [] };
+}
+
+export const OnChainEventResponse = {
+  encode(message: OnChainEventResponse, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    for (const v of message.events) {
+      OnChainEvent.encode(v!, writer.uint32(10).fork()).ldelim();
+    }
+    return writer;
+  },
+
+  decode(input: _m0.Reader | Uint8Array, length?: number): OnChainEventResponse {
+    const reader = input instanceof _m0.Reader ? input : _m0.Reader.create(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOnChainEventResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1:
+          if (tag != 10) {
+            break;
+          }
+
+          message.events.push(OnChainEvent.decode(reader, reader.uint32()));
+          continue;
+      }
+      if ((tag & 7) == 4 || tag == 0) {
+        break;
+      }
+      reader.skipType(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OnChainEventResponse {
+    return { events: Array.isArray(object?.events) ? object.events.map((e: any) => OnChainEvent.fromJSON(e)) : [] };
+  },
+
+  toJSON(message: OnChainEventResponse): unknown {
     const obj: any = {};
     if (message.events) {
-      obj.events = message.events.map((e) => e ? RentRegistryEvent.toJSON(e) : undefined);
+      obj.events = message.events.map((e) => e ? OnChainEvent.toJSON(e) : undefined);
     } else {
       obj.events = [];
     }
     return obj;
   },
 
-  create<I extends Exact<DeepPartial<RentRegistryEventsResponse>, I>>(base?: I): RentRegistryEventsResponse {
-    return RentRegistryEventsResponse.fromPartial(base ?? {});
+  create<I extends Exact<DeepPartial<OnChainEventResponse>, I>>(base?: I): OnChainEventResponse {
+    return OnChainEventResponse.fromPartial(base ?? {});
   },
 
-  fromPartial<I extends Exact<DeepPartial<RentRegistryEventsResponse>, I>>(object: I): RentRegistryEventsResponse {
-    const message = createBaseRentRegistryEventsResponse();
-    message.events = object.events?.map((e) => RentRegistryEvent.fromPartial(e)) || [];
+  fromPartial<I extends Exact<DeepPartial<OnChainEventResponse>, I>>(object: I): OnChainEventResponse {
+    const message = createBaseOnChainEventResponse();
+    message.events = object.events?.map((e) => OnChainEvent.fromPartial(e)) || [];
     return message;
   },
 };
 
-function createBaseStorageAdminRegistryEventRequest(): StorageAdminRegistryEventRequest {
-  return { transactionHash: new Uint8Array() };
+function createBaseStorageLimitsResponse(): StorageLimitsResponse {
+  return { limits: [] };
 }
 
-export const StorageAdminRegistryEventRequest = {
-  encode(message: StorageAdminRegistryEventRequest, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
-    if (message.transactionHash.length !== 0) {
-      writer.uint32(10).bytes(message.transactionHash);
+export const StorageLimitsResponse = {
+  encode(message: StorageLimitsResponse, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    for (const v of message.limits) {
+      StorageLimit.encode(v!, writer.uint32(10).fork()).ldelim();
     }
     return writer;
   },
 
-  decode(input: _m0.Reader | Uint8Array, length?: number): StorageAdminRegistryEventRequest {
+  decode(input: _m0.Reader | Uint8Array, length?: number): StorageLimitsResponse {
     const reader = input instanceof _m0.Reader ? input : _m0.Reader.create(input);
     let end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseStorageAdminRegistryEventRequest();
+    const message = createBaseStorageLimitsResponse();
     while (reader.pos < end) {
       const tag = reader.uint32();
       switch (tag >>> 3) {
@@ -2345,7 +2477,7 @@ export const StorageAdminRegistryEventRequest = {
             break;
           }
 
-          message.transactionHash = reader.bytes();
+          message.limits.push(StorageLimit.decode(reader, reader.uint32()));
           continue;
       }
       if ((tag & 7) == 4 || tag == 0) {
@@ -2356,32 +2488,98 @@ export const StorageAdminRegistryEventRequest = {
     return message;
   },
 
-  fromJSON(object: any): StorageAdminRegistryEventRequest {
-    return {
-      transactionHash: isSet(object.transactionHash) ? bytesFromBase64(object.transactionHash) : new Uint8Array(),
-    };
+  fromJSON(object: any): StorageLimitsResponse {
+    return { limits: Array.isArray(object?.limits) ? object.limits.map((e: any) => StorageLimit.fromJSON(e)) : [] };
   },
 
-  toJSON(message: StorageAdminRegistryEventRequest): unknown {
+  toJSON(message: StorageLimitsResponse): unknown {
     const obj: any = {};
-    message.transactionHash !== undefined &&
-      (obj.transactionHash = base64FromBytes(
-        message.transactionHash !== undefined ? message.transactionHash : new Uint8Array(),
-      ));
+    if (message.limits) {
+      obj.limits = message.limits.map((e) => e ? StorageLimit.toJSON(e) : undefined);
+    } else {
+      obj.limits = [];
+    }
     return obj;
   },
 
-  create<I extends Exact<DeepPartial<StorageAdminRegistryEventRequest>, I>>(
-    base?: I,
-  ): StorageAdminRegistryEventRequest {
-    return StorageAdminRegistryEventRequest.fromPartial(base ?? {});
+  create<I extends Exact<DeepPartial<StorageLimitsResponse>, I>>(base?: I): StorageLimitsResponse {
+    return StorageLimitsResponse.fromPartial(base ?? {});
   },
 
-  fromPartial<I extends Exact<DeepPartial<StorageAdminRegistryEventRequest>, I>>(
-    object: I,
-  ): StorageAdminRegistryEventRequest {
-    const message = createBaseStorageAdminRegistryEventRequest();
-    message.transactionHash = object.transactionHash ?? new Uint8Array();
+  fromPartial<I extends Exact<DeepPartial<StorageLimitsResponse>, I>>(object: I): StorageLimitsResponse {
+    const message = createBaseStorageLimitsResponse();
+    message.limits = object.limits?.map((e) => StorageLimit.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseStorageLimit(): StorageLimit {
+  return { storeType: 0, limit: 0 };
+}
+
+export const StorageLimit = {
+  encode(message: StorageLimit, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    if (message.storeType !== 0) {
+      writer.uint32(8).int32(message.storeType);
+    }
+    if (message.limit !== 0) {
+      writer.uint32(16).uint64(message.limit);
+    }
+    return writer;
+  },
+
+  decode(input: _m0.Reader | Uint8Array, length?: number): StorageLimit {
+    const reader = input instanceof _m0.Reader ? input : _m0.Reader.create(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseStorageLimit();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1:
+          if (tag != 8) {
+            break;
+          }
+
+          message.storeType = reader.int32() as any;
+          continue;
+        case 2:
+          if (tag != 16) {
+            break;
+          }
+
+          message.limit = longToNumber(reader.uint64() as Long);
+          continue;
+      }
+      if ((tag & 7) == 4 || tag == 0) {
+        break;
+      }
+      reader.skipType(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): StorageLimit {
+    return {
+      storeType: isSet(object.storeType) ? storeTypeFromJSON(object.storeType) : 0,
+      limit: isSet(object.limit) ? Number(object.limit) : 0,
+    };
+  },
+
+  toJSON(message: StorageLimit): unknown {
+    const obj: any = {};
+    message.storeType !== undefined && (obj.storeType = storeTypeToJSON(message.storeType));
+    message.limit !== undefined && (obj.limit = Math.round(message.limit));
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<StorageLimit>, I>>(base?: I): StorageLimit {
+    return StorageLimit.fromPartial(base ?? {});
+  },
+
+  fromPartial<I extends Exact<DeepPartial<StorageLimit>, I>>(object: I): StorageLimit {
+    const message = createBaseStorageLimit();
+    message.storeType = object.storeType ?? 0;
+    message.limit = object.limit ?? 0;
     return message;
   },
 };

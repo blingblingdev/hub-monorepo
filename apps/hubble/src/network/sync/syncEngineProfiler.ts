@@ -1,5 +1,5 @@
 import { HubRpcClient } from "@farcaster/hub-nodejs";
-import { formatNumber } from "../../profile.js";
+import { formatNumber } from "../../profile/profile.js";
 
 // Class to collect stats
 export class MethodCallProfile {
@@ -203,46 +203,52 @@ export class SyncEngineProfiler {
           const end = Date.now();
 
           if (prop === "getSyncMetadataByPrefix") {
-            const logArgs = Buffer.from(args[0]["prefix"]).toString("hex");
-            const resultBytes = Math.floor(JSON.stringify(result).length / 2); // 2 hex chars per byte
-            // log.info(
-            //   {
-            //     method: prop,
-            //     duration: end - start,
-            //     args: logArgs,
-            //     bytes: resultBytes,
-            //   },
-            //   "RPC call",
-            // );
-            me._methodProfiles.get(prop)?.addCall(end - start, resultBytes, 1);
+            if (result.isOk()) {
+              const resultBytes = Math.floor(JSON.stringify(result).length / 2); // 2 hex chars per byte
+              // const logArgs = Buffer.from(args[0]["prefix"]).toString("hex");
+              // log.info(
+              //   {
+              //     method: prop,
+              //     duration: end - start,
+              //     args: logArgs,
+              //     bytes: resultBytes,
+              //   },
+              //   "RPC call",
+              // );
+              me._methodProfiles.get(prop)?.addCall(end - start, resultBytes, 1);
+            }
           } else if (prop === "getAllSyncIdsByPrefix") {
-            const logArgs = Buffer.from(args[0]["prefix"]).toString("hex");
-            const numSyncIds = result.value.syncIds.length;
-            const resultBytes = Math.floor(JSON.stringify(result).length / 2); // 2 hex chars per byte
-            // log.info(
-            //   {
-            //     method: prop,
-            //     duration: end - start,
-            //     args: logArgs,
-            //     numSyncIds,
-            //     bytes: resultBytes,
-            //   },
-            //   "RPC call",
-            // );
-            me._methodProfiles.get(prop)?.addCall(end - start, resultBytes, numSyncIds);
+            if (result.isOk() && result.value?.syncIds) {
+              const numSyncIds = result.value.syncIds.length;
+              const resultBytes = Math.floor(JSON.stringify(result).length / 2); // 2 hex chars per byte
+              // const logArgs = Buffer.from(args[0]["prefix"]).toString("hex");
+              // log.info(
+              //   {
+              //     method: prop,
+              //     duration: end - start,
+              //     args: logArgs,
+              //     numSyncIds,
+              //     bytes: resultBytes,
+              //   },
+              //   "RPC call",
+              // );
+              me._methodProfiles.get(prop)?.addCall(end - start, resultBytes, numSyncIds);
+            }
           } else if (prop === "getAllMessagesBySyncIds") {
-            const numMessages = result.value.messages.length;
-            const resultBytes = Math.floor(JSON.stringify(result).length / 2); // 2 hex chars per byte
-            // log.info(
-            //   {
-            //     method: prop,
-            //     duration: end - start,
-            //     numMessages,
-            //     bytes: resultBytes,
-            //   },
-            //   "RPC call",
-            // );
-            me._methodProfiles.get(prop)?.addCall(end - start, resultBytes, numMessages);
+            if (result.isOk() && result.value?.messages) {
+              const numMessages = result.value.messages.length;
+              const resultBytes = Math.floor(JSON.stringify(result).length / 2); // 2 hex chars per byte
+              // log.info(
+              //   {
+              //     method: prop,
+              //     duration: end - start,
+              //     numMessages,
+              //     bytes: resultBytes,
+              //   },
+              //   "RPC call",
+              // );
+              me._methodProfiles.get(prop)?.addCall(end - start, resultBytes, numMessages);
+            }
           }
 
           return result;

@@ -1,5 +1,44 @@
 # @farcaster/hub-nodejs
 
+## 0.10.3
+
+### Patch Changes
+
+- Updated dependencies [41334ab8]
+  - @farcaster/core@0.12.3
+
+## 0.10.2
+
+### Patch Changes
+
+- Updated dependencies [afd2146f]
+  - @farcaster/core@0.12.2
+
+## 0.10.1
+
+### Patch Changes
+
+- Updated dependencies [cfec7767]
+  - @farcaster/core@0.12.1
+
+## 0.10.0
+
+### Minor Changes
+
+- 86149d32: Added storage limits RPC
+
+### Patch Changes
+
+- 3f180073: chore: Update grpc-js and setup grpc server timeouts
+- dcd7a149: feat: support migrating to l2
+- 67e9466e: feat: refactor storage rent events to on chain events
+- Updated dependencies [ec7734cf]
+- Updated dependencies [15fad467]
+- Updated dependencies [dcd7a149]
+- Updated dependencies [67e9466e]
+- Updated dependencies [86149d32]
+  - @farcaster/core@0.12.0
+
 ## 0.9.1
 
 ### Patch Changes

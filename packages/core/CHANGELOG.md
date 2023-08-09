@@ -1,5 +1,36 @@
 # @farcaster/core
 
+## 0.12.3
+
+### Patch Changes
+
+- 41334ab8: fix: Move rust code to apps/hubble, making core package PureJS
+
+## 0.12.2
+
+### Patch Changes
+
+- afd2146f: fix: Remove neon shim to get compilation working
+
+## 0.12.1
+
+### Patch Changes
+
+- cfec7767: fix: Disable the rust code path to make it pureJS for now
+
+## 0.12.0
+
+### Minor Changes
+
+- 86149d32: Added storage limits RPC
+
+### Patch Changes
+
+- ec7734cf: feat: Move blake3 hash into rust
+- 15fad467: feat: Add Rust to the toolchain and use rust for ed25519 signature verification
+- dcd7a149: feat: support migrating to l2
+- 67e9466e: feat: refactor storage rent events to on chain events
+
 ## 0.11.1
 
 ### Patch Changes

@@ -3,18 +3,22 @@ import {
   HubEvent,
   HubResult,
   isMergeMessageHubEvent,
+  isMergeOnChainHubEvent,
   isMergeUsernameProofHubEvent,
   isPruneMessageHubEvent,
   isRevokeMessageHubEvent,
-  isUsernameProofMessage,
+  isStorageRentOnChainEvent,
   Message,
+  OnChainEventType,
+  StorageRentOnChainEvent,
 } from "@farcaster/hub-nodejs";
 import { err, ok } from "neverthrow";
 import RocksDB from "../db/rocksdb.js";
 import { FID_BYTES, RootPrefix, UserMessagePostfix, UserMessagePostfixMax } from "../db/types.js";
 import { logger } from "../../utils/logger.js";
 import { makeFidKey, makeMessagePrimaryKey, makeTsHash, typeToSetPostfix } from "../db/message.js";
-import { bytesCompare, HubAsyncResult } from "@farcaster/core";
+import { bytesCompare, getFarcasterTime, HubAsyncResult } from "@farcaster/core";
+import { forEachOnChainEvent } from "../db/onChainEvent.js";
 
 const makeKey = (fid: number, set: UserMessagePostfix): string => {
   return Buffer.concat([makeFidKey(fid), Buffer.from([set])]).toString("hex");
@@ -22,14 +26,21 @@ const makeKey = (fid: number, set: UserMessagePostfix): string => {
 
 const log = logger.child({ component: "StorageCache" });
 
+type StorageSlot = {
+  units: number;
+  invalidateAt: number;
+};
+
 export class StorageCache {
   private _db: RocksDB;
   private _counts: Map<string, number>;
   private _earliestTsHashes: Map<string, Uint8Array>;
+  private _activeStorageSlots: Map<number, StorageSlot>;
 
   constructor(db: RocksDB, usage?: Map<string, number>) {
     this._counts = usage ?? new Map();
     this._earliestTsHashes = new Map();
+    this._activeStorageSlots = new Map();
     this._db = db;
   }
 
@@ -58,6 +69,25 @@ export class StorageCache {
       15 * 60 * 1000, // 15 minutes
     );
 
+    const time = getFarcasterTime();
+    if (time.isErr()) {
+      log.error({ err: time.error }, "could not obtain time");
+    } else {
+      await forEachOnChainEvent(this._db, OnChainEventType.EVENT_TYPE_STORAGE_RENT, (event) => {
+        const existingSlot = this._activeStorageSlots.get(event.fid);
+        if (isStorageRentOnChainEvent(event) && event.storageRentEventBody.expiry > time.value) {
+          const rentEventBody = event.storageRentEventBody;
+          this._activeStorageSlots.set(event.fid, {
+            units: rentEventBody.units + (existingSlot?.units ?? 0),
+            invalidateAt:
+              (existingSlot?.invalidateAt ?? rentEventBody.expiry) < rentEventBody.expiry
+                ? existingSlot?.invalidateAt ?? rentEventBody.expiry
+                : rentEventBody.expiry,
+          });
+        }
+      });
+    }
+
     this._counts = usage;
     this._earliestTsHashes = new Map();
     log.info({ timeTakenMs: Date.now() - start }, "storage cache synced");
@@ -76,6 +106,44 @@ export class StorageCache {
       );
     }
     return ok(this._counts.get(key) ?? 0);
+  }
+
+  async getCurrentStorageUnitsForFid(fid: number): HubAsyncResult<number> {
+    let slot = this._activeStorageSlots.get(fid);
+
+    if (!slot) {
+      return ok(0);
+    }
+
+    const time = getFarcasterTime();
+
+    if (time.isErr()) {
+      return err(time.error);
+    }
+
+    if (slot.invalidateAt < time.value) {
+      const newSlot = { units: 0, invalidateAt: time.value + 365 * 24 * 60 * 60 };
+      await forEachOnChainEvent(
+        this._db,
+        OnChainEventType.EVENT_TYPE_STORAGE_RENT,
+        (event) => {
+          if (isStorageRentOnChainEvent(event)) {
+            const rentEventBody = event.storageRentEventBody;
+            if (rentEventBody.expiry < time.value) return;
+            if (newSlot.invalidateAt > rentEventBody.expiry) {
+              newSlot.invalidateAt = rentEventBody.expiry;
+            }
+
+            newSlot.units += rentEventBody.units;
+          }
+        },
+        fid,
+      );
+      slot = newSlot;
+      this._activeStorageSlots.set(fid, slot);
+    }
+
+    return ok(slot.units);
   }
 
   async getEarliestTsHash(fid: number, set: UserMessagePostfix): HubAsyncResult<Uint8Array | undefined> {
@@ -126,6 +194,8 @@ export class StorageCache {
       } else if (event.mergeUsernameProofBody.deletedUsernameProofMessage) {
         this.removeMessage(event.mergeUsernameProofBody.deletedUsernameProofMessage);
       }
+    } else if (isMergeOnChainHubEvent(event) && isStorageRentOnChainEvent(event.mergeOnChainEventBody.onChainEvent)) {
+      this.addRent(event.mergeOnChainEventBody.onChainEvent);
     }
     return ok(undefined);
   }
@@ -170,6 +240,33 @@ export class StorageCache {
       const currentEarliest = this._earliestTsHashes.get(key);
       if (currentEarliest === undefined || bytesCompare(currentEarliest, tsHashResult.value) === 0) {
         this._earliestTsHashes.delete(key);
+      }
+    }
+  }
+
+  private addRent(event: StorageRentOnChainEvent): void {
+    if (event !== undefined) {
+      const existingSlot = this._activeStorageSlots.get(event.fid);
+      const time = getFarcasterTime();
+      if (time.isErr()) {
+        log.error({ err: time.error }, "could not obtain time");
+        return;
+      }
+
+      const rentEventBody = event.storageRentEventBody;
+      if (time.value > (existingSlot?.invalidateAt ?? 0)) {
+        this._activeStorageSlots.set(event.fid, {
+          units: rentEventBody.units,
+          invalidateAt: rentEventBody.expiry,
+        });
+      } else {
+        this._activeStorageSlots.set(event.fid, {
+          units: rentEventBody.units + (existingSlot?.units ?? 0),
+          invalidateAt:
+            (existingSlot?.invalidateAt ?? rentEventBody.expiry) < rentEventBody.expiry
+              ? existingSlot?.invalidateAt ?? rentEventBody.expiry
+              : rentEventBody.expiry,
+        });
       }
     }
   }

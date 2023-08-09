@@ -16,11 +16,10 @@ import {
   getSSLHubRpcClient,
   getInsecureHubRpcClient,
   UserNameProof,
-  RentRegistryEvent,
-  StorageAdminRegistryEvent,
-  storageRegistryEventTypeToJSON,
   AckMessageBody,
   NetworkLatencyMessage,
+  OnChainEvent,
+  onChainEventTypeToJSON,
 } from "@farcaster/hub-nodejs";
 import { PeerId } from "@libp2p/interface-peer-id";
 import { peerIdFromBytes } from "@libp2p/peer-id";
@@ -50,8 +49,7 @@ import {
   messageToLog,
   messageTypeToName,
   nameRegistryEventToLog,
-  rentRegistryEventToLog,
-  storageAdminRegistryEventToLog,
+  onChainEventToLog,
   usernameProofToLog,
 } from "./utils/logger.js";
 import {
@@ -60,6 +58,7 @@ import {
   getPublicIp,
   ipFamilyToString,
   p2pMultiAddrStr,
+  parseAddress,
 } from "./utils/p2p.js";
 import { PeriodicTestDataJobScheduler, TestUser } from "./utils/periodicTestDataJob.js";
 import { ensureAboveMinFarcasterVersion, VersionSchedule } from "./utils/versions.js";
@@ -67,11 +66,12 @@ import { CheckFarcasterVersionJobScheduler } from "./storage/jobs/checkFarcaster
 import { ValidateOrRevokeMessagesJobScheduler } from "./storage/jobs/validateOrRevokeMessagesJob.js";
 import { GossipContactInfoJobScheduler } from "./storage/jobs/gossipContactInfoJob.js";
 import { MAINNET_ALLOWED_PEERS } from "./allowedPeers.mainnet.js";
+import { MAINNET_BOOTSTRAP_PEERS } from "./bootstrapPeers.mainnet.js";
 import StoreEventHandler from "./storage/stores/storeEventHandler.js";
 import { FNameRegistryClient, FNameRegistryEventsProvider } from "./eth/fnameRegistryEventsProvider.js";
-import { L2EventsProvider, OPGoerliEthConstants } from "./eth/l2EventsProvider.js";
+import { L2EventsProvider, OptimismConstants } from "./eth/l2EventsProvider.js";
 import { GOSSIP_PROTOCOL_VERSION } from "./network/p2p/protocol.js";
-import { prettyPrintTable } from "./profile.js";
+import { prettyPrintTable } from "./profile/profile.js";
 import packageJson from "./package.json" assert { type: "json" };
 import { createPublicClient, fallback, http } from "viem";
 import { mainnet } from "viem/chains";
@@ -99,8 +99,7 @@ export interface HubInterface {
   submitIdRegistryEvent(event: IdRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number>;
   submitNameRegistryEvent(event: NameRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number>;
   submitUserNameProof(usernameProof: UserNameProof, source?: HubSubmitSource): HubAsyncResult<number>;
-  submitRentRegistryEvent(event: RentRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number>;
-  submitStorageAdminRegistryEvent(event: StorageAdminRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number>;
+  submitOnChainEvent(event: OnChainEvent, source?: HubSubmitSource): HubAsyncResult<number>;
   getHubState(): HubAsyncResult<HubState>;
   putHubState(hubState: HubState): HubAsyncResult<void>;
   gossipContactInfo(): HubAsyncResult<void>;
@@ -119,6 +118,9 @@ export interface HubOptions {
 
   /** A list of PeerId strings to allow connections with */
   allowedPeers?: string[];
+
+  /** A list of PeerId strings to disallow connections with */
+  deniedPeers?: string[];
 
   /** IP address string in MultiAddr format to bind the gossip node to */
   ipMultiAddr?: string;
@@ -165,8 +167,14 @@ export interface HubOptions {
   /** Address of the NameRegistryAddress contract  */
   nameRegistryAddress?: `0x${string}`;
 
-  /** Address of the StorageRegistryAddress contract  */
-  storageRegistryAddress?: `0x${string}`;
+  /** Address of the Id Registry contract  */
+  l2IdRegistryAddress?: `0x${string}`;
+
+  /** Address of the Key Registry contract  */
+  l2KeyRegistryAddress?: `0x${string}`;
+
+  /** Address of the StorageRegistry contract  */
+  l2StorageRegistryAddress?: `0x${string}`;
 
   /** Block number to begin syncing events from  */
   firstBlock?: number;
@@ -179,6 +187,15 @@ export interface HubOptions {
 
   /** Number of blocks to batch when syncing historical events for L2 */
   l2ChunkSize?: number;
+
+  /** Chain Id for L2 */
+  l2ChainId?: number;
+
+  /** Storage rent expiry override for tests */
+  l2RentExpiryOverride?: number;
+
+  /** Resync l2 events */
+  l2ResyncEvents?: boolean;
 
   /** Resync events */
   resyncEthEvents?: boolean;
@@ -251,6 +268,7 @@ export class Hub implements HubInterface {
   private rocksDB: RocksDB;
   private syncEngine: SyncEngine;
   private allowedPeerIds: string[] | undefined;
+  private deniedPeerIds: string[];
 
   private pruneMessagesJobScheduler: PruneMessagesJobScheduler;
   private periodSyncJobScheduler: PeriodicSyncJobScheduler;
@@ -305,10 +323,14 @@ export class Hub implements HubInterface {
         this,
         options.l2RpcUrl,
         options.rankRpcs ?? false,
-        options.storageRegistryAddress ?? OPGoerliEthConstants.StorageRegistryAddress,
-        options.l2FirstBlock ?? OPGoerliEthConstants.FirstBlock,
-        options.l2ChunkSize ?? OPGoerliEthConstants.ChunkSize,
-        options.resyncEthEvents ?? false,
+        options.l2StorageRegistryAddress ?? OptimismConstants.StorageRegistryAddress,
+        options.l2KeyRegistryAddress ?? OptimismConstants.KeyRegistryAddress,
+        options.l2IdRegistryAddress ?? OptimismConstants.IdRegistryAddress,
+        options.l2FirstBlock ?? OptimismConstants.FirstBlock,
+        options.l2ChunkSize ?? OptimismConstants.ChunkSize,
+        options.l2ChainId ?? OptimismConstants.ChainId,
+        options.l2ResyncEvents ?? false,
+        options.l2RentExpiryOverride,
       );
     } else {
       log.warn("No L2 RPC URL provided, not syncing with L2 contract events");
@@ -416,20 +438,14 @@ export class Hub implements HubInterface {
       );
     }
 
-    // if (this.l2RegistryProvider) {
-    //   this.updateRentRegistryEventExpiryJobWorker = new UpdateRentRegistryEventExpiryJobWorker(
-    //     this.updateRentRegistryEventExpiryJobQueue,
-    //     this.rocksDB,
-    //     this.l2RegistryProvider
-    //   );
-    // }
-
     this.allowedPeerIds = this.options.allowedPeers;
     if (this.options.network === FarcasterNetwork.MAINNET) {
       // Mainnet is right now resitrcited to a few peers
       // Append and de-dup the allowed peers
       this.allowedPeerIds = [...new Set([...(this.allowedPeerIds ?? []), ...MAINNET_ALLOWED_PEERS])];
     }
+
+    this.deniedPeerIds = this.options.deniedPeers ?? [];
   }
 
   get rpcAddress() {
@@ -517,18 +533,19 @@ export class Hub implements HubInterface {
     );
 
     // Fetch network config
-    const networkConfig = await fetchNetworkConfig();
-    if (networkConfig.isErr()) {
-      log.error("failed to fetch network config", { error: networkConfig.error });
-    } else {
-      const shouldExit = this.applyNetworkConfig(networkConfig.value);
-      if (shouldExit) {
-        throw new HubError("unavailable", "Exiting due to network config");
+    if (this.options.network === FarcasterNetwork.MAINNET) {
+      const networkConfig = await fetchNetworkConfig();
+      if (networkConfig.isErr()) {
+        log.error("failed to fetch network config", { error: networkConfig.error });
+      } else {
+        const shouldExit = this.applyNetworkConfig(networkConfig.value);
+        if (shouldExit) {
+          throw new HubError("unavailable", "Quitting due to network config");
+        }
+
+        log.info({ networkConfig }, "Network config applied");
       }
-
-      log.info({}, "Network config applied");
     }
-
     await this.engine.start();
 
     // Start the RPC server
@@ -556,12 +573,31 @@ export class Hub implements HubInterface {
       this.updateNameRegistryEventExpiryJobWorker.start();
     }
 
-    await this.gossipNode.start(this.options.bootstrapAddrs ?? [], {
+    let bootstrapAddrs = this.options.bootstrapAddrs ?? [];
+    // Add mainnet bootstrap addresses if none are provided
+    if (bootstrapAddrs.length === 0 && this.options.network === FarcasterNetwork.MAINNET) {
+      bootstrapAddrs = MAINNET_BOOTSTRAP_PEERS.map((a) => parseAddress(a))
+        .map((r) => {
+          if (r.isErr()) {
+            logger.warn(
+              { errorCode: r.error.errCode, message: r.error.message },
+              "Couldn't parse bootstrap address from MAINNET_BOOTSTRAP_PEERS, ignoring",
+            );
+          }
+          return r;
+        })
+        .filter((a) => a.isOk())
+        .map((a) => a._unsafeUnwrap());
+    }
+
+    // Start the Gossip node
+    await this.gossipNode.start(bootstrapAddrs, {
       peerId: this.options.peerId,
       ipMultiAddr: this.options.ipMultiAddr,
       announceIp: this.options.announceIp,
       gossipPort: this.options.gossipPort,
       allowedPeerIdStrs: this.allowedPeerIds,
+      deniedPeerIdStrs: this.deniedPeerIds,
       directPeers: this.options.directPeers,
     });
 
@@ -575,10 +611,17 @@ export class Hub implements HubInterface {
     this.validateOrRevokeMessagesJobScheduler.start();
     this.gossipContactInfoJobScheduler.start();
     this.checkIncomingPortsJobScheduler.start();
-    this.updateNetworkConfigJobScheduler.start();
 
-    // Start the test data generator
-    this.testDataJobScheduler?.start();
+    // Mainnet only jobs
+    if (this.options.network === FarcasterNetwork.MAINNET) {
+      this.updateNetworkConfigJobScheduler.start();
+    }
+
+    // Testnet/Devnet only jobs
+    if (this.options.network !== FarcasterNetwork.MAINNET) {
+      // Start the test data generator
+      this.testDataJobScheduler?.start();
+    }
 
     // When we startup, we write into the DB that we have not yet cleanly shutdown. And when we do
     // shutdown, we'll write "true" to this key, indicating that we've cleanly shutdown.
@@ -588,17 +631,26 @@ export class Hub implements HubInterface {
 
   /** Apply the new the network config. Will return true if the Hub should exit */
   public applyNetworkConfig(networkConfig: NetworkConfig): boolean {
-    const { allowedPeerIds, shouldExit } = applyNetworkConfig(
+    const { allowedPeerIds, deniedPeerIds, shouldExit } = applyNetworkConfig(
       networkConfig,
-      this.allowedPeerIds ?? [],
+      this.allowedPeerIds,
+      this.deniedPeerIds,
       this.options.network,
     );
 
     if (shouldExit) {
       return true;
     } else {
-      this.gossipNode.updateAllowedPeerIds(allowedPeerIds);
-      this.allowedPeerIds = allowedPeerIds;
+      if (allowedPeerIds) {
+        this.gossipNode.updateAllowedPeerIds(allowedPeerIds);
+        this.allowedPeerIds = allowedPeerIds;
+      }
+
+      this.gossipNode.updateDeniedPeerIds(deniedPeerIds);
+      this.deniedPeerIds = deniedPeerIds;
+
+      log.info({ allowedPeerIds, deniedPeerIds }, "Updated Network Config");
+
       return false;
     }
   }
@@ -1086,50 +1138,21 @@ export class Hub implements HubInterface {
     return mergeResult;
   }
 
-  async submitRentRegistryEvent(event: RentRegistryEvent, source?: HubSubmitSource): HubAsyncResult<number> {
-    const logEvent = log.child({ event: rentRegistryEventToLog(event), source });
-    // eslint-disable-next-line no-console
-    console.log("submitting rent event");
-    const mergeResult = await this.engine.mergeRentRegistryEvent(event);
+  async submitOnChainEvent(event: OnChainEvent, source?: HubSubmitSource): HubAsyncResult<number> {
+    const logEvent = log.child({ event: onChainEventToLog(event), source });
 
-    mergeResult.match(
-      (eventId) => {
-        // eslint-disable-next-line no-console
-        console.log(
-          `submitRentRegistryEvent success ${eventId}: fid ${event.fid} assigned ${event.units} in block ${event.blockNumber}`,
-        );
-        logEvent.info(
-          `submitRentRegistryEvent success ${eventId}: fid ${event.fid} assigned ${event.units} in block ${event.blockNumber}`,
-        );
-      },
-      (e) => {
-        // eslint-disable-next-line no-console
-        console.log(`submitRentRegistryEvent error: ${e.message}`);
-        logEvent.warn({ errCode: e.errCode }, `submitRentRegistryEvent error: ${e.message}`);
-      },
-    );
-
-    return mergeResult;
-  }
-
-  async submitStorageAdminRegistryEvent(
-    event: StorageAdminRegistryEvent,
-    source?: HubSubmitSource,
-  ): HubAsyncResult<number> {
-    const logEvent = log.child({ event: storageAdminRegistryEventToLog(event), source });
-
-    const mergeResult = await this.engine.mergeStorageAdminRegistryEvent(event);
+    const mergeResult = await this.engine.mergeOnChainEvent(event);
 
     mergeResult.match(
       (eventId) => {
         logEvent.info(
-          `submitStorageAdminRegistryEvent success ${eventId}: address ${bytesToHexString(
-            event.from,
-          )._unsafeUnwrap()} performed ${storageRegistryEventTypeToJSON(event.type)} in block ${event.blockNumber}`,
+          `submitOnChainEvent success ${eventId}: event ${onChainEventTypeToJSON(event.type)} in block ${
+            event.blockNumber
+          }`,
         );
       },
       (e) => {
-        logEvent.warn({ errCode: e.errCode }, `submitStorageAdminRegistryEvent error: ${e.message}`);
+        logEvent.warn({ errCode: e.errCode }, `submitOnChainEvent error: ${e.message}`);
       },
     );
 
@@ -1182,10 +1205,9 @@ export class Hub implements HubInterface {
     return ResultAsync.fromPromise(this.rocksDB.commit(txn), (e) => e as HubError);
   }
 
-  async isValidPeer(ourPeerId: PeerId, message: ContactInfoContent) {
-    const peerId = ourPeerId.toString();
-    if (this.allowedPeerIds?.length && !this.allowedPeerIds.includes(peerId)) {
-      log.warn(`Peer ${ourPeerId.toString()} is not in the allowed peers list`);
+  async isValidPeer(otherPeerId: PeerId, message: ContactInfoContent) {
+    if (!this.gossipNode.isPeerAllowed(otherPeerId)) {
+      log.warn(`Peer ${otherPeerId.toString()} is not in allowlist or is in the denylist`);
       return false;
     }
 
@@ -1195,7 +1217,7 @@ export class Hub implements HubInterface {
     const versionCheckResult = ensureAboveMinFarcasterVersion(theirVersion);
     if (versionCheckResult.isErr()) {
       log.warn(
-        { peerId: ourPeerId, theirVersion, ourVersion: FARCASTER_VERSION, errMsg: versionCheckResult.error.message },
+        { peerId: otherPeerId, theirVersion, ourVersion: FARCASTER_VERSION, errMsg: versionCheckResult.error.message },
         "Peer is running an outdated version, ignoring",
       );
       return false;
@@ -1203,7 +1225,7 @@ export class Hub implements HubInterface {
 
     if (theirNetwork !== this.options.network) {
       log.warn(
-        { peerId: ourPeerId, theirNetwork, ourNetwork: this.options.network },
+        { peerId: otherPeerId, theirNetwork, ourNetwork: this.options.network },
         "Peer is running a different network, ignoring",
       );
       return false;
