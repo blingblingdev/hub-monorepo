@@ -390,6 +390,10 @@ export const getDbClient = (connectionString?: string) => {
       pool: new Pool({
         max: 10,
         connectionString,
+        ssl: {
+          rejectUnauthorized: false,
+          ca: process.env["POSTGRES_CA"],
+        },
       }),
       cursor: Cursor,
     }),
