@@ -16,6 +16,7 @@ import UserDataStore from "./userDataStore.js";
 import { getMessage, makeTsHash } from "../db/message.js";
 import { UserPostfix } from "../db/types.js";
 import { err } from "neverthrow";
+import { putOnChainEventTransaction } from "../db/onChainEvent.js";
 
 const db = jestRocksDB("protobufs.userDataSet.test");
 const eventHandler = new StoreEventHandler(db);
@@ -32,6 +33,8 @@ beforeAll(async () => {
   addBio = await Factories.UserDataAddMessage.create({
     data: { fid, userDataBody: { type: UserDataType.BIO }, timestamp: addPfp.data.timestamp + 1 },
   });
+  const rent = Factories.StorageRentOnChainEvent.build({ fid }, { transient: { units: 1 } });
+  await db.commit(putOnChainEventTransaction(db.transaction(), rent));
 });
 
 beforeEach(async () => {
@@ -63,6 +66,15 @@ describe("mergeUserNameProof", () => {
     const proof = await Factories.UserNameProof.build();
     await set.mergeUserNameProof(proof);
     await expect(set.getUserNameProof(proof.name)).resolves.toEqual(proof);
+    await expect(set.getUserNameProofByFid(proof.fid)).resolves.toEqual(proof);
+  });
+
+  test("does not merge duplicates", async () => {
+    const proof = await Factories.UserNameProof.build();
+    await set.mergeUserNameProof(proof);
+    await expect(set.getUserNameProof(proof.name)).resolves.toEqual(proof);
+
+    await expect(set.mergeUserNameProof(proof)).rejects.toThrow("already exists");
   });
 
   test("replaces existing proof with proof of greater timestamp", async () => {
@@ -75,6 +87,8 @@ describe("mergeUserNameProof", () => {
     });
     await set.mergeUserNameProof(newProof);
     await expect(set.getUserNameProof(existingProof.name)).resolves.toEqual(newProof);
+    // Secondary index is updated
+    await expect(set.getUserNameProofByFid(existingProof.fid)).resolves.toEqual(newProof);
   });
 
   test("does not merge if existing timestamp is greater", async () => {
@@ -101,6 +115,7 @@ describe("mergeUserNameProof", () => {
     });
     await set.mergeUserNameProof(newProof);
     await expect(set.getUserNameProof(existingProof.name)).rejects.toThrowError("NotFound");
+    await expect(set.getUserNameProofByFid(existingProof.fid)).rejects.toThrowError("NotFound");
   });
 
   test("does not delete existing proof if fid is 0 and timestamp is less than existing", async () => {

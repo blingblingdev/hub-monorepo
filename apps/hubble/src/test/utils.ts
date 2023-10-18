@@ -1,9 +1,10 @@
 import { DeployContractParameters, createTestClient, createWalletClient, custom } from "viem";
 import { Chain, localhost } from "viem/chains";
-import { createPublicClient, http } from "viem";
+import { createPublicClient, http, fallback } from "viem";
 import { Abi } from "abitype";
 import { accounts, localHttpUrl } from "./constants.js";
 import { IdRegistry, NameRegistry, StorageRegistry } from "../eth/abis.js";
+import { DeepPartial } from "fishery";
 
 export const anvilChain = {
   ...localhost,
@@ -16,18 +17,18 @@ export const anvilChain = {
       http: [localHttpUrl],
     },
   },
-} as const satisfies Chain;
+} satisfies Chain;
 
 const provider = {
-  // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+  // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
   on: (message: string, listener: (...args: any[]) => null) => {
     if (message === "accountsChanged") {
-      // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+      // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
       listener([accounts[0].address] as any);
     }
   },
   removeListener: () => null,
-  // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+  // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
   request: async ({ method, params }: any) => {
     if (method === "eth_requestAccounts") {
       return [accounts[0].address];
@@ -72,7 +73,11 @@ export const httpClient = createPublicClient({
   transport: http(localHttpUrl),
 });
 
-export const publicClient = httpClient;
+export const publicClient = createPublicClient({
+  chain: anvilChain,
+  pollingInterval: 1_000,
+  transport: fallback([http(localHttpUrl)]),
+});
 
 export const testClient = createTestClient({
   chain: anvilChain,
@@ -153,3 +158,24 @@ export const deployStorageRegistry = async () => {
     ],
   });
 };
+
+// Deep merge two objects
+export function mergeDeepPartial<T>(obj1: DeepPartial<T>, obj2: DeepPartial<T>): DeepPartial<T> {
+  const merged: DeepPartial<T> = Object.assign({}, obj1);
+
+  for (const key in obj2) {
+    if (
+      typeof obj2[key] === "object" &&
+      obj2[key] !== null &&
+      typeof merged[key] === "object" &&
+      merged[key] !== null
+    ) {
+      // biome-ignore lint/suspicious/noExplicitAny: <explanation>
+      merged[key] = mergeDeepPartial(merged[key] as DeepPartial<any>, obj2[key] as DeepPartial<any>);
+    } else {
+      merged[key] = obj2[key];
+    }
+  }
+
+  return merged;
+}

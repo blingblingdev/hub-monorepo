@@ -16,13 +16,14 @@ import {
   getPageIteratorByPrefix,
   makeMessagePrimaryKey,
   makeTsHash,
+  messageDecode,
   putMessageTransaction,
 } from "../db/message.js";
 import RocksDB, { Iterator, Transaction } from "../db/rocksdb.js";
 import StoreEventHandler, { HubEventArgs } from "./storeEventHandler.js";
 import { MERGE_TIMEOUT_DEFAULT, MessagesPage, PAGE_SIZE_MAX, PageOptions, StorePruneOptions } from "./types.js";
 import AsyncLock from "async-lock";
-import { TSHASH_LENGTH, UserMessagePostfix } from "../db/types.js";
+import { FID_BYTES, TSHASH_LENGTH, UserMessagePostfix, UserMessagePostfixMax } from "../db/types.js";
 import { Result, ResultAsync, err, ok } from "neverthrow";
 import { logger } from "../../utils/logger.js";
 
@@ -36,7 +37,7 @@ const deepPartialEquals = <T>(partial: DeepPartial<T>, whole: T) => {
   if (typeof partial === "object") {
     for (const key in partial) {
       if (partial[key] !== undefined) {
-        // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+        // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
         if (!deepPartialEquals(partial[key] as any, whole[key as keyof T] as any)) {
           return false;
         }
@@ -48,10 +49,6 @@ const deepPartialEquals = <T>(partial: DeepPartial<T>, whole: T) => {
 
   return true;
 };
-
-// Timestamp after which we stop pruning based on time limit. This is in preparation for mainnet migration,
-// since there is no time based pruning with storage based limits.
-const PRUNE_STOP_TIMESTAMP = new Date("2023-08-22").getTime();
 
 export abstract class Store<TAdd extends Message, TRemove extends Message> {
   protected _db: RocksDB;
@@ -166,7 +163,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
 
     const castMessagesPrefix = makeMessagePrimaryKey(extractible.data.fid, this._postfix);
     const filter = (message: Message): message is TRemove => {
-      // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+      // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
       return this._isRemoveType!(message) && deepPartialEquals(extractible, message);
     };
     return getMessagesPageByPrefix(this._db, castMessagesPrefix, filter, pageOptions);
@@ -196,7 +193,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
           message.data.fid.toString(),
           async () => {
             const prunableResult = await this._eventHandler.isPrunable(
-              // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+              // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
               message as any,
               this._postfix,
               this.pruneSizeLimit,
@@ -218,7 +215,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
           },
           { timeout: MERGE_TIMEOUT_DEFAULT },
         )
-        // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+        // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
         .catch((e: any) => {
           throw isHubError(e) ? e : new HubError("unavailable.storage_failure", "merge timed out");
         })
@@ -275,7 +272,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
       makeMessagePrimaryKey(fid, this._postfix),
       async (_key, value) => {
         const message = Result.fromThrowable(
-          () => Message.decode(new Uint8Array(value as Buffer)),
+          () => messageDecode(new Uint8Array(value as Buffer)),
           (e) => e,
         )();
 
@@ -334,12 +331,8 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
   }
 
   get pruneTimeLimit(): number | undefined {
-    // We're deprecating time based pruning, so pick a date in the future that all the hubs can use as a common point
-    // of reference to stop time based pruning. This is so we don't affect sync.
-    if (Date.now() > PRUNE_STOP_TIMESTAMP) {
-      return undefined;
-    }
-    return this._pruneTimeLimit;
+    // No more time based pruning after the migration
+    return undefined;
   }
 
   protected get PRUNE_SIZE_LIMIT_DEFAULT(): number {
@@ -503,7 +496,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
       return err(checkResult.error);
     }
 
-    // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+    // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
     const tsHash = makeTsHash(message.data!.timestamp, message.hash);
 
     if (tsHash.isErr()) {
@@ -514,16 +507,16 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
 
     if (this._isRemoveType) {
       // Checks if there is a remove timestamp hash for this
-      // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+      // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
       const removeKey = this.makeRemoveKey(message as any);
       const removeTsHash = await ResultAsync.fromPromise(this._db.get(removeKey), () => undefined);
 
       if (removeTsHash.isOk()) {
         const removeCompare = this.messageCompare(
-          // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+          // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
           this._removeMessageType!,
           new Uint8Array(removeTsHash.value),
-          // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+          // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
           message.data!.type,
           tsHash.value,
         );
@@ -536,7 +529,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
           // TRemove message and delete it as part of the RocksDB transaction
           const existingRemove = await getMessage<TRemove>(
             this._db,
-            // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+            // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
             message.data!.fid,
             this._postfix,
             removeTsHash.value,
@@ -546,7 +539,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
       }
     }
     // Checks if there is an add timestamp hash for this
-    // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+    // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
     const addKey = this.makeAddKey(message as any);
     const addTsHash = await ResultAsync.fromPromise(this._db.get(addKey), () => undefined);
 
@@ -554,7 +547,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
       const addCompare = this.messageCompare(
         this._addMessageType,
         new Uint8Array(addTsHash.value),
-        // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+        // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
         message.data!.type,
         tsHash.value,
       );
@@ -565,7 +558,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
       } else {
         // If the existing add has a lower order than the new message, retrieve the full
         // TAdd message and delete it as part of the RocksDB transaction
-        // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+        // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
         const existingAdd = await getMessage<TAdd>(this._db, message.data!.fid, this._postfix, addTsHash.value);
         conflicts.push(existingAdd);
       }
@@ -593,7 +586,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
 
   /* Builds a RocksDB transaction to insert a TAdd message and construct its indices */
   private async putAddTransaction(txn: Transaction, message: TAdd): HubAsyncResult<Transaction> {
-    // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+    // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
     const tsHash = makeTsHash(message.data!.timestamp, message.hash);
     if (tsHash.isErr()) {
       throw tsHash.error;
@@ -603,8 +596,25 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
     let addTxn = putMessageTransaction(txn, message);
 
     // Puts the message into the TAdds Set index
-    // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+    // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
     const addsKey = this.makeAddKey(message as any);
+
+    // Run only in TEST. This is a bit of a footgun, so we'll make an exception and run some checks
+    // here. When using a message key for the Removes index, the Postfix must be > UserMessagePostfixMax
+    // to avoid collisions with the Messages undex
+    if (process.env["NODE_ENV"] === "test" || process.env["CI"]) {
+      // Ensure that the Adds key is using a Postfix > UserMessagePostfixMax
+      const keypostfix = addsKey.readUint8(1 + FID_BYTES);
+      if (keypostfix <= UserMessagePostfixMax) {
+        // It's using a message postfix key. Not allowed!
+        return err(
+          new HubError(
+            "unauthorized",
+            "Don't use a message key for the Adds index! Postfix must be > UserMessagePostfixMax",
+          ),
+        );
+      }
+    }
     addTxn = addTxn.put(addsKey, Buffer.from(tsHash.value));
 
     const build = await this.buildSecondaryIndices(addTxn, message);
@@ -617,7 +627,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
 
   /* Builds a RocksDB transaction to remove a TAdd message and delete its indices */
   private async deleteAddTransaction(txn: Transaction, message: TAdd): HubAsyncResult<Transaction> {
-    // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+    // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
     const tsHash = makeTsHash(message.data!.timestamp, message.hash);
     if (tsHash.isErr()) {
       throw tsHash.error;
@@ -629,7 +639,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
     }
 
     // Delete the message key from TAdds Set index
-    // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+    // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
     const addsKey = this.makeAddKey(message as any);
     const deleteTxn = txn.del(addsKey);
 
@@ -643,7 +653,7 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
       throw new Error("remove type is unsupported for this store");
     }
 
-    // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+    // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
     const tsHash = makeTsHash(message.data!.timestamp, message.hash);
     if (tsHash.isErr()) {
       throw tsHash.error;
@@ -653,8 +663,26 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
     let removeTxn = putMessageTransaction(txn, message);
 
     // Puts message key into the TRemoves Set index
-    // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+    // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
     const removesKey = this.makeRemoveKey(message as any);
+
+    // Run only in TEST. This is a bit of a footgun, so we'll make an exception and run some checks
+    // here. When using a message key for the Removes index, the Postfix must be > UserMessagePostfixMax
+    // to avoid collisions with the Messages undex
+    if (process.env["NODE_ENV"] === "test" || process.env["CI"]) {
+      // Ensure that the Removes key is using a Postfix > UserMessagePostfixMax
+      const keypostfix = removesKey.readUint8(1 + FID_BYTES);
+      if (keypostfix <= UserMessagePostfixMax) {
+        // It's using a message postfix key. Not allowed!
+        return err(
+          new HubError(
+            "unauthorized",
+            "Don't use a message key for the Removes index! Postfix must be > UserMessagePostfixMax",
+          ),
+        );
+      }
+    }
+
     removeTxn = removeTxn.put(removesKey, Buffer.from(tsHash.value));
 
     return ok(removeTxn);
@@ -666,14 +694,14 @@ export abstract class Store<TAdd extends Message, TRemove extends Message> {
       throw new Error("remove type is unsupported for this store");
     }
 
-    // rome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
+    // biome-ignore lint/style/noNonNullAssertion: legacy code, avoid using ignore for new code
     const tsHash = makeTsHash(message.data!.timestamp, message.hash);
     if (tsHash.isErr()) {
       throw tsHash.error;
     }
 
     // Delete message key from TRemoves Set index
-    // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+    // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
     const removesKey = this.makeRemoveKey(message as any);
     const deleteTxn = txn.del(removesKey);
 

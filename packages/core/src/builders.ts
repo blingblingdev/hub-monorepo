@@ -5,6 +5,7 @@ import { HubAsyncResult } from "./errors";
 import { Signer } from "./signers";
 import { getFarcasterTime } from "./time";
 import * as validations from "./validations";
+import { PublicClients, defaultPublicClients } from "./eth/clients";
 
 /** Internal Types  */
 
@@ -21,8 +22,6 @@ type MessageBodyOptions = Pick<
   | "reactionBody"
   | "verificationAddEthAddressBody"
   | "verificationRemoveBody"
-  | "signerAddBody"
-  | "signerRemoveBody"
   | "userDataBody"
   | "linkBody"
   | "usernameProofBody"
@@ -34,6 +33,7 @@ const makeMessageData = async <TData extends protobufs.MessageData>(
   bodyOptions: MessageBodyOptions,
   messageType: protobufs.MessageType,
   dataOptions: MessageDataOptions,
+  publicClients: PublicClients = defaultPublicClients,
 ): HubAsyncResult<TData> => {
   if (!dataOptions.timestamp) {
     getFarcasterTime().map((timestamp) => {
@@ -47,7 +47,7 @@ const makeMessageData = async <TData extends protobufs.MessageData>(
     ...dataOptions,
   });
 
-  return validations.validateMessageData(data as TData);
+  return validations.validateMessageData(data as TData, publicClients);
 };
 
 const makeMessage = async <TMessage extends protobufs.Message>(
@@ -233,8 +233,9 @@ export const makeVerificationAddEthAddress = async (
   body: protobufs.VerificationAddEthAddressBody,
   dataOptions: MessageDataOptions,
   signer: Signer,
+  publicClients: PublicClients = defaultPublicClients,
 ): HubAsyncResult<protobufs.VerificationAddEthAddressMessage> => {
-  const data = await makeVerificationAddEthAddressData(body, dataOptions);
+  const data = await makeVerificationAddEthAddressData(body, dataOptions, publicClients);
   if (data.isErr()) {
     return err(data.error);
   }
@@ -256,11 +257,13 @@ export const makeVerificationRemove = async (
 export const makeVerificationAddEthAddressData = (
   body: protobufs.VerificationAddEthAddressBody,
   dataOptions: MessageDataOptions,
+  publicClients: PublicClients = defaultPublicClients,
 ): HubAsyncResult<protobufs.VerificationAddEthAddressData> => {
   return makeMessageData(
     { verificationAddEthAddressBody: body },
     protobufs.MessageType.VERIFICATION_ADD_ETH_ADDRESS,
     dataOptions,
+    publicClients,
   );
 };
 
@@ -269,48 +272,6 @@ export const makeVerificationRemoveData = (
   dataOptions: MessageDataOptions,
 ): HubAsyncResult<protobufs.VerificationRemoveData> => {
   return makeMessageData({ verificationRemoveBody: body }, protobufs.MessageType.VERIFICATION_REMOVE, dataOptions);
-};
-
-/* -------------------------------------------------------------------------- */
-/*                               SIGNER METHODS                               */
-/* -------------------------------------------------------------------------- */
-
-export const makeSignerAdd = async (
-  body: protobufs.SignerAddBody,
-  dataOptions: MessageDataOptions,
-  signer: Signer,
-): HubAsyncResult<protobufs.SignerAddMessage> => {
-  const data = await makeSignerAddData(body, dataOptions);
-  if (data.isErr()) {
-    return err(data.error);
-  }
-  return makeMessage(data.value, signer);
-};
-
-export const makeSignerRemove = async (
-  body: protobufs.SignerRemoveBody,
-  dataOptions: MessageDataOptions,
-  signer: Signer,
-): HubAsyncResult<protobufs.SignerRemoveMessage> => {
-  const data = await makeSignerRemoveData(body, dataOptions);
-  if (data.isErr()) {
-    return err(data.error);
-  }
-  return makeMessage(data.value, signer);
-};
-
-export const makeSignerAddData = (
-  body: protobufs.SignerAddBody,
-  dataOptions: MessageDataOptions,
-): HubAsyncResult<protobufs.SignerAddData> => {
-  return makeMessageData({ signerAddBody: body }, protobufs.MessageType.SIGNER_ADD, dataOptions);
-};
-
-export const makeSignerRemoveData = (
-  body: protobufs.SignerRemoveBody,
-  dataOptions: MessageDataOptions,
-): HubAsyncResult<protobufs.SignerRemoveData> => {
-  return makeMessageData({ signerRemoveBody: body }, protobufs.MessageType.SIGNER_REMOVE, dataOptions);
 };
 
 /* -------------------------------------------------------------------------- */

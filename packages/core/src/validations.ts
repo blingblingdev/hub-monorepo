@@ -8,12 +8,10 @@ import { getFarcasterTime, toFarcasterTime } from "./time";
 import { makeVerificationEthAddressClaim } from "./verifications";
 import { UserNameType } from "./protobufs";
 import { normalize } from "viem/ens";
+import { defaultPublicClients, PublicClients } from "./eth/clients";
 
 /** Number of seconds (10 minutes) that is appropriate for clock skew */
 export const ALLOWED_CLOCK_SKEW_SECONDS = 10 * 60;
-
-/** Message types that must be signed by EIP712 signer */
-export const EIP712_MESSAGE_TYPES = [protobufs.MessageType.SIGNER_ADD, protobufs.MessageType.SIGNER_REMOVE];
 
 export const FNAME_REGEX = /^[a-z0-9][a-z0-9-]{0,15}$/;
 export const HEX_REGEX = /^(0x)?[0-9A-Fa-f]+$/;
@@ -116,27 +114,42 @@ export const validateEd25519PublicKey = (publicKey?: Uint8Array | null): HubResu
 export const validateMessage = async (
   message: protobufs.Message,
   validationMethods: ValidationMethods = pureJSValidationMethods,
+  publicClients: PublicClients = defaultPublicClients,
 ): HubAsyncResult<protobufs.Message> => {
   // 1. Check the message data
   const data = message.data;
   if (!data) {
     return err(new HubError("bad_request.validation_failure", "data is missing"));
   }
-  const validData = await validateMessageData(data);
+  const validData = await validateMessageData(data, publicClients);
   if (validData.isErr()) {
     return err(validData.error);
   }
 
-  // 2. Check that the hashScheme and hash are valid
+  // The hash to verify the signature against. This is either the hash of the data_bytes, or the hash
+  // of the data field encoded using ts-proto protobuf
   const hash = message.hash;
   if (!hash) {
     return err(new HubError("bad_request.validation_failure", "hash is missing"));
   }
 
-  const dataBytes = protobufs.MessageData.encode(data).finish();
-  if (message.hashScheme === protobufs.HashScheme.BLAKE3) {
-    const computedHash = validationMethods.blake3_20(dataBytes);
+  // Computed from the data_bytes if set, otherwise from the data
+  let computedHash;
 
+  // 2. If the data_bytes are set, we'll validate signature against that
+  if (message.dataBytes && message.dataBytes.length > 0) {
+    if (message.dataBytes.length > 1024) {
+      return err(new HubError("bad_request.validation_failure", "dataBytes > 1024 bytes"));
+    }
+    // 2a. Use the databytes as the hash to check the signature against
+    computedHash = validationMethods.blake3_20(message.dataBytes);
+  } else {
+    // 2b. Use the protobuf encoded data as the hash to check the signature against
+    computedHash = validationMethods.blake3_20(protobufs.MessageData.encode(data).finish());
+  }
+
+  // 3. Check that the hashScheme and hash are valid
+  if (message.hashScheme === protobufs.HashScheme.BLAKE3) {
     // we have to use bytesCompare, because TypedArrays cannot be compared directly
     if (bytesCompare(hash, computedHash) !== 0) {
       return err(new HubError("bad_request.validation_failure", "invalid hash"));
@@ -145,27 +158,20 @@ export const validateMessage = async (
     return err(new HubError("bad_request.validation_failure", "invalid hashScheme"));
   }
 
-  // 2. Check that the signatureScheme and signature are valid
+  // 4. Check that the signatureScheme and signature are valid
   const signature = message.signature;
   if (!signature) {
     return err(new HubError("bad_request.validation_failure", "signature is missing"));
   }
 
+  // 5. Check that the signer is valid
   const signer = message.signer;
   if (!signer) {
     return err(new HubError("bad_request.validation_failure", "signer is missing"));
   }
 
-  const eip712SignerRequired = EIP712_MESSAGE_TYPES.includes(data.type);
-  if (message.signatureScheme === protobufs.SignatureScheme.EIP712 && eip712SignerRequired) {
-    const verificationResult = await eip712.verifyMessageHashSignature(hash, signature, signer);
-    if (verificationResult.isErr()) {
-      return err(verificationResult.error);
-    }
-    if (!verificationResult.value) {
-      return err(new HubError("bad_request.validation_failure", "signature does not match signer"));
-    }
-  } else if (message.signatureScheme === protobufs.SignatureScheme.ED25519 && !eip712SignerRequired) {
+  // 6. Check that the signature is valid
+  if (message.signatureScheme === protobufs.SignatureScheme.ED25519) {
     const signatureIsValid = await validationMethods.ed25519_verify(signature, hash, signer);
 
     if (!signatureIsValid) {
@@ -178,7 +184,10 @@ export const validateMessage = async (
   return ok(message);
 };
 
-export const validateMessageData = async <T extends protobufs.MessageData>(data: T): HubAsyncResult<T> => {
+export const validateMessageData = async <T extends protobufs.MessageData>(
+  data: T,
+  publicClients: PublicClients = defaultPublicClients,
+): HubAsyncResult<T> => {
   // 1. Validate fid
   const validFid = validateFid(data.fid);
   if (validFid.isErr()) {
@@ -208,7 +217,7 @@ export const validateMessageData = async <T extends protobufs.MessageData>(data:
   }
 
   // 5. Validate body
-  // rome-ignore lint/suspicious/noExplicitAny: legacy from eslint migration
+  // biome-ignore lint/suspicious/noExplicitAny: legacy from eslint migration
   let bodyResult: HubResult<any>;
   if (validType.value === protobufs.MessageType.CAST_ADD && !!data.castAddBody) {
     // Allow usage of embedsDeprecated if timestamp is before cut-off
@@ -227,10 +236,6 @@ export const validateMessageData = async <T extends protobufs.MessageData>(data:
     !!data.linkBody
   ) {
     bodyResult = validateLinkBody(data.linkBody);
-  } else if (validType.value === protobufs.MessageType.SIGNER_ADD && !!data.signerAddBody) {
-    bodyResult = validateSignerAddBody(data.signerAddBody);
-  } else if (validType.value === protobufs.MessageType.SIGNER_REMOVE && !!data.signerRemoveBody) {
-    bodyResult = validateSignerRemoveBody(data.signerRemoveBody);
   } else if (validType.value === protobufs.MessageType.USER_DATA_ADD && !!data.userDataBody) {
     bodyResult = validateUserDataAddBody(data.userDataBody);
   } else if (
@@ -242,6 +247,7 @@ export const validateMessageData = async <T extends protobufs.MessageData>(data:
       data.verificationAddEthAddressBody,
       validFid.value,
       validNetwork.value,
+      publicClients,
     );
   } else if (validType.value === protobufs.MessageType.VERIFICATION_REMOVE && !!data.verificationRemoveBody) {
     bodyResult = validateVerificationRemoveBody(data.verificationRemoveBody);
@@ -262,7 +268,12 @@ export const validateVerificationAddEthAddressSignature = async (
   body: protobufs.VerificationAddEthAddressBody,
   fid: number,
   network: protobufs.FarcasterNetwork,
+  publicClients: PublicClients = defaultPublicClients,
 ): HubAsyncResult<Uint8Array> => {
+  if (body.ethSignature.length > 256) {
+    return err(new HubError("bad_request.validation_failure", "ethSignature > 256 bytes"));
+  }
+
   const reconstructedClaim = makeVerificationEthAddressClaim(fid, body.address, network, body.blockHash);
   if (reconstructedClaim.isErr()) {
     return err(reconstructedClaim.error);
@@ -272,6 +283,9 @@ export const validateVerificationAddEthAddressSignature = async (
     reconstructedClaim.value,
     body.ethSignature,
     body.address,
+    body.verificationType,
+    body.chainId,
+    publicClients,
   );
 
   if (verificationResult.isErr()) {
@@ -279,7 +293,7 @@ export const validateVerificationAddEthAddressSignature = async (
   }
 
   if (!verificationResult.value) {
-    return err(new HubError("bad_request.validation_failure", "ethSignature does not match address"));
+    return err(new HubError("bad_request.validation_failure", "invalid ethSignature"));
   }
 
   return ok(body.ethSignature);
@@ -407,7 +421,7 @@ export const validateCastAddBody = (
       return err(new HubError("bad_request.validation_failure", "mentionsPositions must be a position in text"));
     }
     if (i > 0) {
-      // rome-ignore lint/style/noNonNullAssertion: not sure why we do this, legacy when migrating from eslint.
+      // biome-ignore lint/style/noNonNullAssertion: not sure why we do this, legacy when migrating from eslint.
       const prevPosition = body.mentionsPositions[i - 1]!;
       if (position < prevPosition) {
         return err(
@@ -517,6 +531,7 @@ export const validateVerificationAddEthAddressBody = async (
   body: protobufs.VerificationAddEthAddressBody,
   fid: number,
   network: protobufs.FarcasterNetwork,
+  publicClients: PublicClients,
 ): HubAsyncResult<protobufs.VerificationAddEthAddressBody> => {
   const validAddress = validateEthAddress(body.address);
   if (validAddress.isErr()) {
@@ -528,7 +543,7 @@ export const validateVerificationAddEthAddressBody = async (
     return err(validBlockHash.error);
   }
 
-  const validSignature = await validateVerificationAddEthAddressSignature(body, fid, network);
+  const validSignature = await validateVerificationAddEthAddressSignature(body, fid, network, publicClients);
   if (validSignature.isErr()) {
     return err(validSignature.error);
   }
@@ -574,29 +589,6 @@ export const validateUsernameProofBody = (
     );
   }
   return ok(body);
-};
-
-export const validateSignerAddBody = (body: protobufs.SignerAddBody): HubResult<protobufs.SignerAddBody> => {
-  if (body.name !== undefined) {
-    const textUtf8BytesResult = utf8StringToBytes(body.name);
-    if (textUtf8BytesResult.isErr()) {
-      return err(new HubError("bad_request.invalid_param", "name cannot be encoded as utf8"));
-    }
-
-    if (textUtf8BytesResult.value.length === 0) {
-      return err(new HubError("bad_request.validation_failure", "name cannot be empty string"));
-    }
-
-    if (textUtf8BytesResult.value.length > 32) {
-      return err(new HubError("bad_request.validation_failure", "name > 32 bytes"));
-    }
-  }
-
-  return validateEd25519PublicKey(body.signer).map(() => body);
-};
-
-export const validateSignerRemoveBody = (body: protobufs.SignerRemoveBody): HubResult<protobufs.SignerRemoveBody> => {
-  return validateEd25519PublicKey(body.signer).map(() => body);
 };
 
 export const validateUserDataType = (type: number): HubResult<protobufs.UserDataType> => {

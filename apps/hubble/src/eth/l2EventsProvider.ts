@@ -1,7 +1,6 @@
 import {
   hexStringToBytes,
   HubAsyncResult,
-  HubState,
   IdRegisterEventBody,
   IdRegisterEventType,
   OnChainEvent,
@@ -18,23 +17,35 @@ import { IdRegistryV2, KeyRegistry, StorageRegistry } from "./abis.js";
 import { HubInterface } from "../hubble.js";
 import { logger } from "../utils/logger.js";
 import { optimismGoerli } from "viem/chains";
-import { createPublicClient, fallback, http, Log, OnLogsParameter, PublicClient } from "viem";
+import {
+  createPublicClient,
+  fallback,
+  http,
+  Log,
+  WatchContractEventOnLogsParameter,
+  PublicClient,
+  Hex,
+  FallbackTransport,
+} from "viem";
 import { WatchContractEvent } from "./watchContractEvent.js";
 import { WatchBlockNumber } from "./watchBlockNumber.js";
-import { ExtractAbiEvent } from "abitype";
+import { Abi, ExtractAbiEvent } from "abitype";
 import { onChainEventSorter } from "../storage/db/onChainEvent.js";
+import { formatPercentage } from "../profile/profile.js";
+import { addProgressBar } from "../utils/progressBars.js";
+import { statsd } from "../utils/statsd.js";
 
 const log = logger.child({
   component: "L2EventsProvider",
 });
 
 export class OptimismConstants {
-  public static StorageRegistryAddress = "0x000000fC0a4Fccee0b30E360773F7888D1bD9FAA" as const;
-  public static KeyRegistryAddress = "0x000000fc6548800fc8265d8eb7061d88cefb87c2" as const;
-  public static IdRegistryAddress = "0x000000fc99489b8cd629291d97dbca62b81173c4" as const;
-  public static FirstBlock = 12500000;
+  public static StorageRegistryAddress = "0x00000000fcce7f938e7ae6d3c335bd6a1a7c593d" as const;
+  public static KeyRegistryAddress = "0x00000000fc9e66f1c6d86d750b4af47ff0cc343d" as const;
+  public static IdRegistryAddress = "0x00000000fcaf86937e41ba038b4fa40baa4b780a" as const;
+  public static FirstBlock = 108864739; // ~Aug 29 2023 5:00pm UTC
   public static ChunkSize = 1000;
-  public static ChainId = 420; // OP Goerli
+  public static ChainId = 10; // OP mainnet
 }
 
 const RENT_EXPIRY_IN_SECONDS = 365 * 24 * 60 * 60; // One year
@@ -44,13 +55,14 @@ const RENT_EXPIRY_IN_SECONDS = 365 * 24 * 60 * 60; // One year
  */
 export class L2EventsProvider {
   private _hub: HubInterface;
-  private _publicClient: PublicClient;
+  private _publicClient: PublicClient<FallbackTransport>;
 
   private _firstBlock: number;
   private _chunkSize: number;
   private _chainId: number;
   private _rentExpiry: number;
   private _resyncEvents: boolean;
+  private _useFilters: boolean;
 
   private _onChainEventsByBlock: Map<number, Array<OnChainEvent>>;
   private _retryDedupMap: Map<number, boolean>;
@@ -58,18 +70,22 @@ export class L2EventsProvider {
 
   private _lastBlockNumber: number;
 
-  private _watchStorageContractEvents: WatchContractEvent<typeof StorageRegistry.abi, string, true>;
-  private _watchKeyRegistryContractEvents: WatchContractEvent<typeof KeyRegistry.abi, string, true>;
-  private _watchIdRegistryContractEvents: WatchContractEvent<typeof IdRegistryV2.abi, string, true>;
-  private _watchBlockNumber: WatchBlockNumber;
+  private storageRegistryAddress: `0x${string}` | undefined;
+  private keyRegistryAddress: `0x${string}` | undefined;
+  private idRegistryAddress: `0x${string}` | undefined;
+
+  private _watchStorageContractEvents?: WatchContractEvent<typeof StorageRegistry.abi, string, true>;
+  private _watchKeyRegistryContractEvents?: WatchContractEvent<typeof KeyRegistry.abi, string, true>;
+  private _watchIdRegistryContractEvents?: WatchContractEvent<typeof IdRegistryV2.abi, string, true>;
+  private _watchBlockNumber?: WatchBlockNumber;
 
   // Whether the historical events have been synced. This is used to avoid syncing the events multiple times.
   private _isHistoricalSyncDone = false;
+  private _isHandlingBlock = false;
 
   // Number of blocks to wait before processing an event. This is hardcoded to
-  // 6 for now, because that's the threshold beyond which blocks are unlikely
-  // to reorg anymore. 6 blocks represents ~72 seconds on Goerli, so the delay
-  // is not too long.
+  // 2 for now, because that's the threshold beyond which blocks are unlikely
+  // to reorg anymore. Note that these are blocks on the L2 chain, not the L1.
   static numConfirmations = 2;
 
   // Events are only processed after `numConfirmations` blocks have been confirmed; poll less
@@ -80,10 +96,10 @@ export class L2EventsProvider {
 
   constructor(
     hub: HubInterface,
-    publicClient: PublicClient,
-    storageRegistryAddress: `0x${string}`,
-    keyRegistryAddress: `0x${string}`,
-    idRegistryAddress: `0x${string}`,
+    publicClient: PublicClient<FallbackTransport>,
+    storageRegistryAddress: `0x${string}` | undefined,
+    keyRegistryAddress: `0x${string}` | undefined,
+    idRegistryAddress: `0x${string}` | undefined,
     firstBlock: number,
     chunkSize: number,
     chainId: number,
@@ -96,6 +112,7 @@ export class L2EventsProvider {
     this._chunkSize = chunkSize;
     this._chainId = chainId;
     this._resyncEvents = resyncEvents;
+    this._useFilters = false;
     this._rentExpiry = expiryOverride ?? RENT_EXPIRY_IN_SECONDS;
 
     this._lastBlockNumber = 0;
@@ -105,6 +122,442 @@ export class L2EventsProvider {
     this._onChainEventsByBlock = new Map();
     this._retryDedupMap = new Map();
     this._blockTimestampsCache = new Map();
+
+    this.setAddresses(storageRegistryAddress, keyRegistryAddress, idRegistryAddress);
+
+    if (expiryOverride) {
+      log.warn(`Overriding rent expiry to ${expiryOverride} seconds`);
+    }
+  }
+
+  /**
+   *
+   * Build an L2 Events Provider for the ID Registry and Name Registry contracts.
+   */
+  public static build(
+    hub: HubInterface,
+    l2RpcUrl: string,
+    rankRpcs: boolean,
+    storageRegistryAddress: `0x${string}` | undefined,
+    keyRegistryAddress: `0x${string}` | undefined,
+    idRegistryAddress: `0x${string}` | undefined,
+    firstBlock: number,
+    chunkSize: number,
+    chainId: number,
+    resyncEvents: boolean,
+    expiryOverride?: number,
+  ): L2EventsProvider {
+    const l2RpcUrls = l2RpcUrl.split(",");
+    const transports = l2RpcUrls.map((url) => http(url, { retryCount: 10 }));
+
+    const publicClient = createPublicClient({
+      chain: optimismGoerli,
+      transport: fallback(transports, { rank: rankRpcs }),
+    });
+
+    const provider = new L2EventsProvider(
+      hub,
+      publicClient,
+      storageRegistryAddress,
+      keyRegistryAddress,
+      idRegistryAddress,
+      firstBlock,
+      chunkSize,
+      chainId,
+      resyncEvents,
+      expiryOverride,
+    );
+
+    return provider;
+  }
+
+  public getLatestBlockNumber(): number {
+    return this._lastBlockNumber;
+  }
+
+  public async start() {
+    // Connect to L2 RPC
+    await this.connectAndSyncHistoricalEvents();
+
+    this._watchBlockNumber?.start();
+    this._watchStorageContractEvents?.start();
+    this._watchKeyRegistryContractEvents?.start();
+    this._watchIdRegistryContractEvents?.start();
+  }
+
+  public async stop() {
+    this._watchStorageContractEvents?.stop();
+    this._watchKeyRegistryContractEvents?.stop();
+    this._watchIdRegistryContractEvents?.stop();
+    this._watchBlockNumber?.stop();
+
+    // Wait for all async promises to resolve
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  /* -------------------------------------------------------------------------- */
+  /*                               Private Methods                              */
+  /* -------------------------------------------------------------------------- */
+
+  private async processStorageEvents(logs: WatchContractEventOnLogsParameter<Abi, string, true>) {
+    for (const event of logs) {
+      const { blockNumber, blockHash, transactionHash, transactionIndex, logIndex } = event;
+
+      // Do nothing if the block is pending
+      if (
+        blockHash === null ||
+        blockNumber === null ||
+        transactionHash === null ||
+        transactionIndex === null ||
+        logIndex === null
+      ) {
+        continue;
+      }
+
+      // Handling: use try-catch + log since errors are expected and not important to surface
+      try {
+        if (event.eventName === "Rent") {
+          // Fix when viem fixes https://github.com/wagmi-dev/viem/issues/938
+          const rentEvent = event as Log<
+            bigint,
+            number,
+            boolean,
+            ExtractAbiEvent<typeof StorageRegistry.abi, "Rent">,
+            true,
+            typeof StorageRegistry.abi
+          >;
+          const blockTimestamp = await this._getBlockTimestamp(blockHash);
+          const blockTimeAsFarcasterTime = toFarcasterTime(blockTimestamp * 1000);
+          if (blockTimeAsFarcasterTime.isErr()) {
+            log.error(blockTimeAsFarcasterTime.error, "failed to parse block timestamp");
+            continue;
+          }
+          const expiry = blockTimeAsFarcasterTime.value + this._rentExpiry;
+          const storageRentEventBody = StorageRentEventBody.create({
+            payer: hexStringToBytes(rentEvent.args.payer)._unsafeUnwrap(),
+            units: Number(rentEvent.args.units),
+            expiry: expiry,
+          });
+          await this.cacheOnChainEvent(
+            OnChainEventType.EVENT_TYPE_STORAGE_RENT,
+            rentEvent.args.fid,
+            blockNumber,
+            blockHash,
+            transactionHash,
+            transactionIndex,
+            logIndex,
+            undefined,
+            undefined,
+            undefined,
+            storageRentEventBody,
+          );
+        }
+      } catch (e) {
+        log.error(e);
+        log.error({ event }, "failed to parse event args");
+      }
+    }
+  }
+
+  private async processKeyRegistryEvents(logs: WatchContractEventOnLogsParameter<Abi, string, true>) {
+    for (const event of logs) {
+      const { blockNumber, blockHash, transactionHash, transactionIndex, logIndex } = event;
+
+      // Do nothing if the block is pending
+      if (
+        blockHash === null ||
+        blockNumber === null ||
+        transactionHash === null ||
+        transactionIndex === null ||
+        logIndex === null
+      ) {
+        continue;
+      }
+
+      // Handling: use try-catch + log since errors are expected and not important to surface
+      try {
+        if (event.eventName === "Add") {
+          const addEvent = event as Log<
+            bigint,
+            number,
+            boolean,
+            ExtractAbiEvent<typeof KeyRegistry.abi, "Add">,
+            true,
+            typeof KeyRegistry.abi
+          >;
+          const signerEventBody = SignerEventBody.create({
+            eventType: SignerEventType.ADD,
+            key: hexStringToBytes(addEvent.args.keyBytes)._unsafeUnwrap(),
+            keyType: addEvent.args.keyType,
+            metadata: hexStringToBytes(addEvent.args.metadata)._unsafeUnwrap(),
+            metadataType: addEvent.args.metadataType,
+          });
+          await this.cacheOnChainEvent(
+            OnChainEventType.EVENT_TYPE_SIGNER,
+            addEvent.args.fid,
+            blockNumber,
+            blockHash,
+            transactionHash,
+            transactionIndex,
+            logIndex,
+            signerEventBody,
+          );
+        } else if (event.eventName === "Remove") {
+          const removeEvent = event as Log<
+            bigint,
+            number,
+            boolean,
+            ExtractAbiEvent<typeof KeyRegistry.abi, "Remove">,
+            true,
+            typeof KeyRegistry.abi
+          >;
+          const signerEventBody = SignerEventBody.create({
+            eventType: SignerEventType.REMOVE,
+            key: hexStringToBytes(removeEvent.args.keyBytes)._unsafeUnwrap(),
+          });
+          await this.cacheOnChainEvent(
+            OnChainEventType.EVENT_TYPE_SIGNER,
+            removeEvent.args.fid,
+            blockNumber,
+            blockHash,
+            transactionHash,
+            transactionIndex,
+            logIndex,
+            signerEventBody,
+          );
+        } else if (event.eventName === "AdminReset") {
+          const resetEvent = event as Log<
+            bigint,
+            number,
+            boolean,
+            ExtractAbiEvent<typeof KeyRegistry.abi, "AdminReset">,
+            true,
+            typeof KeyRegistry.abi
+          >;
+          const signerEventBody = SignerEventBody.create({
+            eventType: SignerEventType.ADMIN_RESET,
+            key: hexStringToBytes(resetEvent.args.keyBytes)._unsafeUnwrap(),
+          });
+          await this.cacheOnChainEvent(
+            OnChainEventType.EVENT_TYPE_SIGNER,
+            resetEvent.args.fid,
+            blockNumber,
+            blockHash,
+            transactionHash,
+            transactionIndex,
+            logIndex,
+            signerEventBody,
+          );
+        } else if (event.eventName === "Migrated") {
+          const migratedEvent = event as Log<
+            bigint,
+            number,
+            boolean,
+            ExtractAbiEvent<typeof KeyRegistry.abi, "Migrated">,
+            true,
+            typeof KeyRegistry.abi
+          >;
+          await this.cacheOnChainEvent(
+            OnChainEventType.EVENT_TYPE_SIGNER_MIGRATED,
+            0n,
+            blockNumber,
+            blockHash,
+            transactionHash,
+            transactionIndex,
+            logIndex,
+            undefined,
+            SignerMigratedEventBody.create({
+              migratedAt: Number(migratedEvent.args.keysMigratedAt),
+            }),
+          );
+        }
+      } catch (e) {
+        log.error(e);
+        log.error({ event }, "failed to parse signer event args");
+      }
+    }
+  }
+
+  private async processIdRegistryEvents(logs: WatchContractEventOnLogsParameter<Abi, string, true>) {
+    for (const event of logs) {
+      const { blockNumber, blockHash, transactionHash, transactionIndex, logIndex } = event;
+
+      // Do nothing if the block is pending
+      if (
+        blockHash === null ||
+        blockNumber === null ||
+        transactionHash === null ||
+        transactionIndex === null ||
+        logIndex === null
+      ) {
+        continue;
+      }
+
+      // Handling: use try-catch + log since errors are expected and not important to surface
+      try {
+        if (event.eventName === "Register") {
+          const registerEvent = event as Log<
+            bigint,
+            number,
+            boolean,
+            ExtractAbiEvent<typeof IdRegistryV2.abi, "Register">,
+            true,
+            typeof IdRegistryV2.abi
+          >;
+          const idRegisterEventBody = IdRegisterEventBody.create({
+            eventType: IdRegisterEventType.REGISTER,
+            to: hexStringToBytes(registerEvent.args.to)._unsafeUnwrap(),
+            recoveryAddress: hexStringToBytes(registerEvent.args.recovery)._unsafeUnwrap(),
+          });
+          await this.cacheOnChainEvent(
+            OnChainEventType.EVENT_TYPE_ID_REGISTER,
+            registerEvent.args.id,
+            blockNumber,
+            blockHash,
+            transactionHash,
+            transactionIndex,
+            logIndex,
+            undefined,
+            undefined,
+            idRegisterEventBody,
+          );
+        } else if (event.eventName === "Transfer") {
+          const transferEvent = event as Log<
+            bigint,
+            number,
+            boolean,
+            ExtractAbiEvent<typeof IdRegistryV2.abi, "Transfer">,
+            true,
+            typeof IdRegistryV2.abi
+          >;
+          const idRegisterEventBody = IdRegisterEventBody.create({
+            eventType: IdRegisterEventType.TRANSFER,
+            to: hexStringToBytes(transferEvent.args.to)._unsafeUnwrap(),
+            from: hexStringToBytes(transferEvent.args.from)._unsafeUnwrap(),
+          });
+          await this.cacheOnChainEvent(
+            OnChainEventType.EVENT_TYPE_ID_REGISTER,
+            transferEvent.args.id,
+            blockNumber,
+            blockHash,
+            transactionHash,
+            transactionIndex,
+            logIndex,
+            undefined,
+            undefined,
+            idRegisterEventBody,
+          );
+        } else if (event.eventName === "ChangeRecoveryAddress") {
+          const transferEvent = event as Log<
+            bigint,
+            number,
+            boolean,
+            ExtractAbiEvent<typeof IdRegistryV2.abi, "ChangeRecoveryAddress">,
+            true,
+            typeof IdRegistryV2.abi
+          >;
+          const idRegisterEventBody = IdRegisterEventBody.create({
+            eventType: IdRegisterEventType.CHANGE_RECOVERY,
+            recoveryAddress: hexStringToBytes(transferEvent.args.recovery)._unsafeUnwrap(),
+          });
+          await this.cacheOnChainEvent(
+            OnChainEventType.EVENT_TYPE_ID_REGISTER,
+            transferEvent.args.id,
+            blockNumber,
+            blockHash,
+            transactionHash,
+            transactionIndex,
+            logIndex,
+            undefined,
+            undefined,
+            idRegisterEventBody,
+          );
+        }
+      } catch (e) {
+        log.error(e);
+        log.error({ event }, "failed to parse signer event args");
+      }
+    }
+  }
+
+  /** Connect to Ethereum RPC */
+  private async connectAndSyncHistoricalEvents() {
+    const latestBlockResult = await ResultAsync.fromPromise(this._publicClient.getBlockNumber(), (err) => err);
+    if (latestBlockResult.isErr()) {
+      log.error(
+        { err: latestBlockResult.error },
+        "failed to connect to optimism node. Check your eth RPC URL (e.g. --l2-rpc-url)",
+      );
+      return;
+    }
+    const latestBlock = Number(latestBlockResult.value);
+
+    if (!latestBlock) {
+      log.error("failed to get the latest block from the RPC provider");
+      return;
+    }
+
+    log.info({ latestBlock: latestBlock }, "connected to optimism node");
+
+    // Find how how much we need to sync
+    let lastSyncedBlock = this._firstBlock;
+
+    const hubState = await this._hub.getHubState();
+    if (hubState.isOk() && hubState.value.lastL2Block) {
+      // Look back 2 blocks just in case hub was shut down before it received enough confirmations to persist the cached events
+      lastSyncedBlock = hubState.value.lastL2Block - L2EventsProvider.numConfirmations;
+    }
+
+    if (this._resyncEvents) {
+      log.info(`Resyncing events from ${this._firstBlock} instead of ${lastSyncedBlock}`);
+      lastSyncedBlock = this._firstBlock;
+    }
+
+    log.info({ lastSyncedBlock }, "last synced block");
+    const toBlock = latestBlock;
+
+    if (lastSyncedBlock < toBlock) {
+      log.info({ fromBlock: lastSyncedBlock, toBlock }, "syncing events from missed blocks");
+
+      // Check if filters are supported, reduce batch size if necessary
+      await this.detectFilterSupport();
+      const chunkSize = this._useFilters ? this._chunkSize : 250;
+
+      // Sync old Rent events
+      await this.syncHistoricalEvents(lastSyncedBlock, toBlock, chunkSize);
+    }
+
+    this._isHistoricalSyncDone = true;
+  }
+
+  /**
+   * Retry events from a specific block number
+   *
+   * @param blockNumber
+   */
+  public async retryEventsFromBlock(blockNumber: number) {
+    if (this._retryDedupMap.has(blockNumber)) {
+      return;
+    }
+    this._retryDedupMap.set(blockNumber, true);
+
+    // Sync old events
+    await this.syncHistoricalEvents(blockNumber, blockNumber + 1, 1);
+  }
+
+  public setAddresses(
+    storageRegistryAddress?: `0x${string}`,
+    keyRegistryAddress?: `0x${string}`,
+    idRegistryAddress?: `0x${string}`,
+  ) {
+    if (!storageRegistryAddress || !keyRegistryAddress || !idRegistryAddress) {
+      log.info("No L2 addresses provided. Not watching events");
+      return;
+    }
+
+    this.idRegistryAddress = idRegistryAddress;
+    this.keyRegistryAddress = keyRegistryAddress;
+    this.storageRegistryAddress = storageRegistryAddress;
 
     // Setup StorageRegistry contract
     this._watchStorageContractEvents = new WatchContractEvent(
@@ -150,392 +603,9 @@ export class L2EventsProvider {
         log.error(`Error watching new block numbers: ${error}`, { error });
       },
     });
-
-    if (expiryOverride) {
-      log.warn(`Overriding rent expiry to ${expiryOverride} seconds`);
-    }
-  }
-
-  /**
-   *
-   * Build an L2 Events Provider for the ID Registry and Name Registry contracts.
-   */
-  public static build(
-    hub: HubInterface,
-    l2RpcUrl: string,
-    rankRpcs: boolean,
-    storageRegistryAddress: `0x${string}`,
-    keyRegistryAddress: `0x${string}`,
-    idRegistryAddress: `0x${string}`,
-    firstBlock: number,
-    chunkSize: number,
-    chainId: number,
-    resyncEvents: boolean,
-    expiryOverride?: number,
-  ): L2EventsProvider {
-    const l2RpcUrls = l2RpcUrl.split(",");
-    const transports = l2RpcUrls.map((url) => http(url, { retryCount: 10 }));
-
-    const publicClient = createPublicClient({
-      chain: optimismGoerli,
-      transport: fallback(transports, { rank: rankRpcs }),
-    });
-
-    const provider = new L2EventsProvider(
-      hub,
-      publicClient,
-      storageRegistryAddress,
-      keyRegistryAddress,
-      idRegistryAddress,
-      firstBlock,
-      chunkSize,
-      chainId,
-      resyncEvents,
-      expiryOverride,
+    log.info(
+      `StorageRegistry: ${storageRegistryAddress}, KeyRegistry: ${keyRegistryAddress}, IdRegistry: ${idRegistryAddress}`,
     );
-
-    return provider;
-  }
-
-  public getLatestBlockNumber(): number {
-    return this._lastBlockNumber;
-  }
-
-  public async start() {
-    // Connect to L2 RPC
-    await this.connectAndSyncHistoricalEvents();
-
-    this._watchBlockNumber.start();
-    this._watchStorageContractEvents.start();
-    this._watchKeyRegistryContractEvents.start();
-    this._watchIdRegistryContractEvents.start();
-  }
-
-  public async stop() {
-    this._watchStorageContractEvents.stop();
-    this._watchKeyRegistryContractEvents.stop();
-    this._watchIdRegistryContractEvents.stop();
-    this._watchBlockNumber.stop();
-
-    // Wait for all async promises to resolve
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-
-  /* -------------------------------------------------------------------------- */
-  /*                               Private Methods                              */
-  /* -------------------------------------------------------------------------- */
-
-  private async processStorageEvents(
-    // rome-ignore lint/suspicious/noExplicitAny: workaround viem bug
-    logs: OnLogsParameter<any, true, string>,
-  ) {
-    for (const event of logs) {
-      const { blockNumber, blockHash, transactionHash, transactionIndex, address } = event;
-
-      // Do nothing if the block is pending
-      if (blockHash === null || blockNumber === null || transactionHash === null || transactionIndex === null) {
-        continue;
-      }
-
-      // Handling: use try-catch + log since errors are expected and not important to surface
-      try {
-        if (event.eventName === "Rent") {
-          // Fix when viem fixes https://github.com/wagmi-dev/viem/issues/938
-          const rentEvent = event as Log<
-            bigint,
-            number,
-            ExtractAbiEvent<typeof StorageRegistry.abi, "Rent">,
-            true,
-            typeof StorageRegistry.abi
-          >;
-          const blockTimestamp = await this._getBlockTimestamp(blockHash);
-          const blockTimeAsFarcasterTime = toFarcasterTime(blockTimestamp * 1000);
-          if (blockTimeAsFarcasterTime.isErr()) {
-            log.error(blockTimeAsFarcasterTime.error, "failed to parse block timestamp");
-            continue;
-          }
-          const expiry = blockTimeAsFarcasterTime.value + this._rentExpiry;
-          const storageRentEventBody = StorageRentEventBody.create({
-            payer: hexStringToBytes(rentEvent.args.payer)._unsafeUnwrap(),
-            units: Number(rentEvent.args.units),
-            expiry: expiry,
-          });
-          await this.cacheOnChainEvent(
-            OnChainEventType.EVENT_TYPE_STORAGE_RENT,
-            rentEvent.args.fid,
-            blockNumber,
-            blockHash,
-            transactionHash,
-            transactionIndex,
-            undefined,
-            undefined,
-            undefined,
-            storageRentEventBody,
-          );
-        }
-      } catch (e) {
-        log.error(e);
-        log.error({ event }, "failed to parse event args");
-      }
-    }
-  }
-
-  private async processKeyRegistryEvents(
-    // rome-ignore lint/suspicious/noExplicitAny: workaround viem bug
-    logs: OnLogsParameter<any, true, string>,
-  ) {
-    for (const event of logs) {
-      const { blockNumber, blockHash, transactionHash, transactionIndex } = event;
-
-      // Do nothing if the block is pending
-      if (blockHash === null || blockNumber === null || transactionHash === null || transactionIndex === null) {
-        continue;
-      }
-
-      // Handling: use try-catch + log since errors are expected and not important to surface
-      try {
-        if (event.eventName === "Add") {
-          const addEvent = event as Log<
-            bigint,
-            number,
-            ExtractAbiEvent<typeof KeyRegistry.abi, "Add">,
-            true,
-            typeof KeyRegistry.abi
-          >;
-          const signerEventBody = SignerEventBody.create({
-            eventType: SignerEventType.ADD,
-            key: hexStringToBytes(addEvent.args.keyBytes)._unsafeUnwrap(),
-            scheme: addEvent.args.scheme,
-            metadata: hexStringToBytes(addEvent.args.metadata)._unsafeUnwrap(),
-          });
-          await this.cacheOnChainEvent(
-            OnChainEventType.EVENT_TYPE_SIGNER,
-            addEvent.args.fid,
-            blockNumber,
-            blockHash,
-            transactionHash,
-            transactionIndex,
-            signerEventBody,
-          );
-        } else if (event.eventName === "Remove") {
-          const removeEvent = event as Log<
-            bigint,
-            number,
-            ExtractAbiEvent<typeof KeyRegistry.abi, "Remove">,
-            true,
-            typeof KeyRegistry.abi
-          >;
-          const signerEventBody = SignerEventBody.create({
-            eventType: SignerEventType.REMOVE,
-            key: hexStringToBytes(removeEvent.args.keyBytes)._unsafeUnwrap(),
-          });
-          await this.cacheOnChainEvent(
-            OnChainEventType.EVENT_TYPE_SIGNER,
-            removeEvent.args.fid,
-            blockNumber,
-            blockHash,
-            transactionHash,
-            transactionIndex,
-            signerEventBody,
-          );
-        } else if (event.eventName === "AdminReset") {
-          const resetEvent = event as Log<
-            bigint,
-            number,
-            ExtractAbiEvent<typeof KeyRegistry.abi, "AdminReset">,
-            true,
-            typeof KeyRegistry.abi
-          >;
-          const signerEventBody = SignerEventBody.create({
-            eventType: SignerEventType.ADMIN_RESET,
-            key: hexStringToBytes(resetEvent.args.keyBytes)._unsafeUnwrap(),
-          });
-          await this.cacheOnChainEvent(
-            OnChainEventType.EVENT_TYPE_SIGNER,
-            resetEvent.args.fid,
-            blockNumber,
-            blockHash,
-            transactionHash,
-            transactionIndex,
-            signerEventBody,
-          );
-        } else if (event.eventName === "Migrated") {
-          const migratedEvent = event as Log<
-            bigint,
-            number,
-            ExtractAbiEvent<typeof KeyRegistry.abi, "Migrated">,
-            true,
-            typeof KeyRegistry.abi
-          >;
-          await this.cacheOnChainEvent(
-            OnChainEventType.EVENT_TYPE_SIGNER_MIGRATED,
-            0n,
-            blockNumber,
-            blockHash,
-            transactionHash,
-            transactionIndex,
-            undefined,
-            SignerMigratedEventBody.create({ migratedAt: Number(migratedEvent.args.keysMigratedAt) }),
-          );
-        }
-      } catch (e) {
-        log.error(e);
-        log.error({ event }, "failed to parse signer event args");
-      }
-    }
-  }
-
-  private async processIdRegistryEvents(
-    // rome-ignore lint/suspicious/noExplicitAny: workaround viem bug
-    logs: OnLogsParameter<any, true, string>,
-  ) {
-    for (const event of logs) {
-      const { blockNumber, blockHash, transactionHash, transactionIndex } = event;
-
-      // Do nothing if the block is pending
-      if (blockHash === null || blockNumber === null || transactionHash === null || transactionIndex === null) {
-        continue;
-      }
-
-      // Handling: use try-catch + log since errors are expected and not important to surface
-      try {
-        if (event.eventName === "Register") {
-          const registerEvent = event as Log<
-            bigint,
-            number,
-            ExtractAbiEvent<typeof IdRegistryV2.abi, "Register">,
-            true,
-            typeof IdRegistryV2.abi
-          >;
-          const idRegisterEventBody = IdRegisterEventBody.create({
-            eventType: IdRegisterEventType.REGISTER,
-            to: hexStringToBytes(registerEvent.args.to)._unsafeUnwrap(),
-            recoveryAddress: hexStringToBytes(registerEvent.args.recovery)._unsafeUnwrap(),
-          });
-          await this.cacheOnChainEvent(
-            OnChainEventType.EVENT_TYPE_ID_REGISTER,
-            registerEvent.args.id,
-            blockNumber,
-            blockHash,
-            transactionHash,
-            transactionIndex,
-            undefined,
-            undefined,
-            idRegisterEventBody,
-          );
-        } else if (event.eventName === "Transfer") {
-          const transferEvent = event as Log<
-            bigint,
-            number,
-            ExtractAbiEvent<typeof IdRegistryV2.abi, "Transfer">,
-            true,
-            typeof IdRegistryV2.abi
-          >;
-          const idRegisterEventBody = IdRegisterEventBody.create({
-            eventType: IdRegisterEventType.TRANSFER,
-            to: hexStringToBytes(transferEvent.args.to)._unsafeUnwrap(),
-            from: hexStringToBytes(transferEvent.args.from)._unsafeUnwrap(),
-          });
-          await this.cacheOnChainEvent(
-            OnChainEventType.EVENT_TYPE_ID_REGISTER,
-            0n,
-            blockNumber,
-            blockHash,
-            transactionHash,
-            transactionIndex,
-            undefined,
-            undefined,
-            idRegisterEventBody,
-          );
-        } else if (event.eventName === "ChangeRecoveryAddress") {
-          const transferEvent = event as Log<
-            bigint,
-            number,
-            ExtractAbiEvent<typeof IdRegistryV2.abi, "ChangeRecoveryAddress">,
-            true,
-            typeof IdRegistryV2.abi
-          >;
-          const idRegisterEventBody = IdRegisterEventBody.create({
-            eventType: IdRegisterEventType.CHANGE_RECOVERY,
-            recoveryAddress: hexStringToBytes(transferEvent.args.recovery)._unsafeUnwrap(),
-          });
-          await this.cacheOnChainEvent(
-            OnChainEventType.EVENT_TYPE_ID_REGISTER,
-            transferEvent.args.id,
-            blockNumber,
-            blockHash,
-            transactionHash,
-            transactionIndex,
-            undefined,
-            undefined,
-            idRegisterEventBody,
-          );
-        }
-      } catch (e) {
-        log.error(e);
-        log.error({ event }, "failed to parse signer event args");
-      }
-    }
-  }
-
-  /** Connect to Ethereum RPC */
-  private async connectAndSyncHistoricalEvents() {
-    const latestBlockResult = await ResultAsync.fromPromise(this._publicClient.getBlockNumber(), (err) => err);
-    if (latestBlockResult.isErr()) {
-      log.error(
-        { err: latestBlockResult.error },
-        "failed to connect to optimism node. Check your eth RPC URL (e.g. --l2-rpc-url)",
-      );
-      return;
-    }
-    const latestBlock = Number(latestBlockResult.value);
-
-    if (!latestBlock) {
-      log.error("failed to get the latest block from the RPC provider");
-      return;
-    }
-
-    log.info({ latestBlock: latestBlock }, "connected to ethereum node");
-
-    // Find how how much we need to sync
-    let lastSyncedBlock = this._firstBlock;
-
-    const hubState = await this._hub.getHubState();
-    if (hubState.isOk() && hubState.value.lastEthBlock) {
-      lastSyncedBlock = hubState.value.lastEthBlock;
-    }
-
-    if (this._resyncEvents) {
-      log.info(`Resyncing events from ${this._firstBlock} instead of ${lastSyncedBlock}`);
-      lastSyncedBlock = this._firstBlock;
-    }
-
-    log.info({ lastSyncedBlock }, "last synced block");
-    const toBlock = latestBlock;
-
-    if (lastSyncedBlock < toBlock) {
-      log.info({ fromBlock: lastSyncedBlock, toBlock }, "syncing events from missed blocks");
-
-      // Sync old Rent events
-      await this.syncHistoricalEvents(lastSyncedBlock, toBlock, this._chunkSize);
-    }
-
-    this._isHistoricalSyncDone = true;
-  }
-
-  /**
-   * Retry events from a specific block number
-   *
-   * @param blockNumber
-   */
-  public async retryEventsFromBlock(blockNumber: number) {
-    if (this._retryDedupMap.has(blockNumber)) {
-      return;
-    }
-    this._retryDedupMap.set(blockNumber, true);
-
-    // Sync old events
-    await this.syncHistoricalEvents(blockNumber, blockNumber + 1, 1);
   }
 
   /**
@@ -543,6 +613,9 @@ export class L2EventsProvider {
    * in the sync queue to be processed later, to make sure we don't process any unconfirmed events.
    */
   private async syncHistoricalEvents(fromBlock: number, toBlock: number, batchSize: number) {
+    if (!this.idRegistryAddress || !this.keyRegistryAddress || !this.storageRegistryAddress) {
+      return;
+    }
     /*
      * Querying Blocks in Batches
      *
@@ -561,7 +634,13 @@ export class L2EventsProvider {
      */
 
     // Calculate amount of runs required based on batchSize, and round up to capture all blocks
-    const numOfRuns = Math.ceil((toBlock - fromBlock) / batchSize);
+    const totalBlocks = toBlock - fromBlock;
+    const numOfRuns = Math.ceil(totalBlocks / batchSize);
+
+    let progressBar;
+    if (totalBlocks > 100) {
+      progressBar = addProgressBar("Syncing Farcaster L2 Contracts", totalBlocks);
+    }
 
     for (let i = 0; i < numOfRuns; i++) {
       this._blockTimestampsCache.clear(); // Clear the cache for each block to avoid unbounded growth
@@ -572,50 +651,127 @@ export class L2EventsProvider {
         // If this isn't our first loop, we need to up the fromBlock by 1, or else we will be re-caching an already cached block.
         nextFromBlock += 1;
       }
-      log.info({ fromBlock: nextFromBlock, toBlock: nextToBlock }, "syncing events from block range");
 
-      const idFilter = await this._publicClient.createContractEventFilter({
-        address: OptimismConstants.IdRegistryAddress,
+      log.debug(
+        { fromBlock: nextFromBlock, toBlock: nextToBlock },
+        `syncing events (${formatPercentage((nextFromBlock - fromBlock) / totalBlocks)})`,
+      );
+      progressBar?.update(Math.max(nextFromBlock - fromBlock - 1, 0));
+      statsd().increment("l2events.blocks", Math.min(toBlock, nextToBlock - nextFromBlock));
+
+      const idLogsPromise = this.getContractEvents({
+        address: this.idRegistryAddress,
         abi: IdRegistryV2.abi,
         fromBlock: BigInt(nextFromBlock),
         toBlock: BigInt(nextToBlock),
         strict: true,
       });
-      const idLogs = await this._publicClient.getFilterLogs({ filter: idFilter });
-      await this.processIdRegistryEvents(idLogs);
 
-      const storageFilter = await this._publicClient.createContractEventFilter({
-        address: OptimismConstants.StorageRegistryAddress,
+      const storageLogsPromise = this.getContractEvents({
+        address: this.storageRegistryAddress,
         abi: StorageRegistry.abi,
         fromBlock: BigInt(nextFromBlock),
         toBlock: BigInt(nextToBlock),
         strict: true,
       });
-      const storageLogs = await this._publicClient.getFilterLogs({
-        filter: storageFilter,
-      });
-      await this.processStorageEvents(storageLogs);
 
-      const keyFilter = await this._publicClient.createContractEventFilter({
-        address: OptimismConstants.KeyRegistryAddress,
+      const keyLogsPromise = this.getContractEvents({
+        address: this.keyRegistryAddress,
         abi: KeyRegistry.abi,
         fromBlock: BigInt(nextFromBlock),
         toBlock: BigInt(nextToBlock),
         strict: true,
       });
-      const keyLogs = await this._publicClient.getFilterLogs({ filter: keyFilter });
-      await this.processKeyRegistryEvents(keyLogs);
+
+      await this.processIdRegistryEvents(await idLogsPromise);
+      await this.processStorageEvents(await storageLogsPromise);
+      await this.processKeyRegistryEvents(await keyLogsPromise);
+    }
+
+    progressBar?.update(totalBlocks);
+    progressBar?.stop();
+  }
+
+  /** Wrapper around Viem client getFilterLogs/getContractEvents. Uses filters
+   *  when supported, otherwise falls back to getContractEvents.
+   */
+  private async getContractEvents(params: {
+    address: Hex;
+    abi: Abi;
+    fromBlock: bigint;
+    toBlock: bigint;
+    strict: boolean;
+  }) {
+    try {
+      if (this._useFilters) {
+        const filter = await this._publicClient.createContractEventFilter(params);
+        return this._publicClient.getFilterLogs({
+          filter,
+        });
+      } else {
+        return this._publicClient.getContractEvents(params);
+      }
+    } catch (err) {
+      log.error({ err, params }, "failed to get contract events");
+      return [];
+    }
+  }
+
+  /** Detect whether the configured RPC provider supports filters */
+  private async detectFilterSupport() {
+    // Set up a client with fewer retries and shorter timeout
+    const urls: string[] = [];
+    this._publicClient.transport["transports"].forEach((transport) => {
+      if (transport?.value) {
+        urls.push(transport.value["url"]);
+      }
+    });
+    const transports = urls.map((url) => http(url, { retryCount: 1, timeout: 1000 }));
+    const testClient = createPublicClient({
+      chain: optimismGoerli,
+      transport: fallback(transports),
+    });
+
+    // Handling: intentionally catch to test for filter support
+    try {
+      await testClient.createEventFilter({
+        fromBlock: BigInt(1),
+        toBlock: BigInt(1),
+      });
+      this._useFilters = true;
+      log.info("RPC provider supports filters. Using eth_getFilterLogs");
+    } catch (err) {
+      this._useFilters = false;
+      log.info("RPC provider does not support filters. Falling back to eth_getLogs");
     }
   }
 
   /** Handle a new block. Processes all events in the cache that have now been confirmed */
   private async handleNewBlock(blockNumber: number) {
+    // Don't let multiple blocks be handled at once
+    while (this._isHandlingBlock) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    this._isHandlingBlock = true;
     log.info({ blockNumber }, `new block: ${blockNumber}`);
+    statsd().increment("l2events.blocks");
 
     // Get all blocks that have been confirmed into a single array and sort.
     const cachedBlocksSet = new Set([...this._onChainEventsByBlock.keys()]);
     const cachedBlocks = Array.from(cachedBlocksSet);
     cachedBlocks.sort();
+
+    let progressBar;
+    let firstBlock = 0;
+    let totalBlocks = 0;
+    if (cachedBlocks.length > 100) {
+      // Lots of blocks, so show a progress bar
+      const lastBlock = cachedBlocks[cachedBlocks.length - 1] ?? 0;
+      firstBlock = cachedBlocks[0] ?? 0;
+      totalBlocks = lastBlock - firstBlock;
+      progressBar = addProgressBar("Processing Farcaster L2 Contract Events", totalBlocks);
+    }
 
     for (const cachedBlock of cachedBlocks) {
       if (cachedBlock + L2EventsProvider.numConfirmations <= blockNumber) {
@@ -629,15 +785,26 @@ export class L2EventsProvider {
 
         this._retryDedupMap.delete(cachedBlock);
       }
+
+      progressBar?.update(cachedBlock - firstBlock);
     }
+
+    progressBar?.update(totalBlocks);
+    progressBar?.stop();
 
     // Update the last synced block if all the historical events have been synced
     if (this._isHistoricalSyncDone) {
-      const hubState = HubState.create({ lastEthBlock: blockNumber });
-      await this._hub.putHubState(hubState);
+      const hubState = await this._hub.getHubState();
+      if (hubState.isOk()) {
+        hubState.value.lastL2Block = blockNumber;
+        await this._hub.putHubState(hubState.value);
+      } else {
+        log.error({ errCode: hubState.error.errCode }, `failed to get hub state: ${hubState.error.message}`);
+      }
     }
 
     this._blockTimestampsCache.clear(); // Clear the cache periodically to avoid unbounded growth
+    this._isHandlingBlock = false;
     this._lastBlockNumber = blockNumber;
   }
 
@@ -647,7 +814,8 @@ export class L2EventsProvider {
     blockNumBigInt: bigint,
     blockHash: string,
     transactionHash: string,
-    index: number,
+    txIndex: number,
+    logIndex: number,
     signerEventBody?: SignerEventBody,
     signerMigratedEventBody?: SignerMigratedEventBody,
     idRegisterEventBody?: IdRegisterEventBody,
@@ -656,6 +824,8 @@ export class L2EventsProvider {
     const blockNumber = Number(blockNumBigInt);
     const logEvent = log.child({ event: { type, blockNumber } });
     const serialized = Result.combine([hexStringToBytes(blockHash), hexStringToBytes(transactionHash)]);
+
+    statsd().gauge("contracts.block_number", blockNumber);
 
     if (serialized.isErr()) {
       logEvent.error({ errCode: serialized.error.errCode }, `cacheOnChainEvent error: ${serialized.error.message}`);
@@ -673,7 +843,8 @@ export class L2EventsProvider {
       blockHash: blockHashBytes,
       blockTimestamp: timestamp,
       transactionHash: transactionHashBytes,
-      logIndex: index,
+      txIndex: txIndex,
+      logIndex: logIndex,
       signerEventBody: signerEventBody,
       signerMigratedEventBody: signerMigratedEventBody,
       idRegisterEventBody: idRegisterEventBody,

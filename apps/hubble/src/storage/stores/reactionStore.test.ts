@@ -22,7 +22,7 @@ import { getMessage, makeTsHash } from "../db/message.js";
 import { UserPostfix } from "../db/types.js";
 import ReactionStore from "../stores/reactionStore.js";
 import StoreEventHandler from "../stores/storeEventHandler.js";
-import { FARCASTER_EPOCH } from "@farcaster/core";
+import { putOnChainEventTransaction } from "../db/onChainEvent.js";
 
 const db = jestRocksDB("protobufs.reactionStore.test");
 const eventHandler = new StoreEventHandler(db);
@@ -61,6 +61,8 @@ beforeAll(async () => {
   reactionRemoveRecast = await Factories.ReactionRemoveMessage.create({
     data: { fid, reactionBody: recastBody, timestamp: reactionAddRecast.data.timestamp + 1 },
   });
+  const rent = Factories.StorageRentOnChainEvent.build({ fid }, { transient: { units: 1 } });
+  await db.commit(putOnChainEventTransaction(db.transaction(), rent));
 });
 
 beforeEach(async () => {
@@ -965,69 +967,6 @@ describe("pruneMessages", () => {
       expect(result._unsafeUnwrap().length).toEqual(1);
 
       expect(prunedMessages).toEqual([add1]);
-    });
-  });
-
-  describe("with time limit", () => {
-    const timePrunedStore = new ReactionStore(db, eventHandler, { pruneTimeLimit: 60 * 60 - 1 });
-
-    test("prunes earliest messages", async () => {
-      const messages = [add1, add2, remove3, add4];
-      for (const message of messages) {
-        await timePrunedStore.merge(message);
-      }
-
-      const nowOrig = Date.now;
-      Date.now = () => FARCASTER_EPOCH + (add4.data.timestamp - 1 + 60 * 60) * 1000;
-      try {
-        const result = await timePrunedStore.pruneMessages(fid);
-        expect(result.isOk()).toBeTruthy();
-      } finally {
-        Date.now = nowOrig;
-      }
-
-      expect(prunedMessages).toEqual([add1, add2, remove3]);
-
-      await expect(
-        timePrunedStore.getReactionAdd(
-          fid,
-          add1.data.reactionBody.type,
-          add1.data.reactionBody.targetCastId ?? Factories.CastId.build(),
-        ),
-      ).rejects.toThrow(HubError);
-      await expect(
-        timePrunedStore.getReactionAdd(
-          fid,
-          add2.data.reactionBody.type,
-          add2.data.reactionBody.targetCastId ?? Factories.CastId.build(),
-        ),
-      ).rejects.toThrow(HubError);
-      await expect(
-        timePrunedStore.getReactionRemove(
-          fid,
-          remove3.data.reactionBody.type,
-          remove3.data.reactionBody.targetCastId ?? Factories.CastId.build(),
-        ),
-      ).rejects.toThrow(HubError);
-    });
-
-    test("fails to merge messages that would be immediately pruned", async () => {
-      const messages = [add1, add2];
-      for (const message of messages) {
-        await timePrunedStore.merge(message);
-      }
-
-      await expect(timePrunedStore.merge(addOld1)).rejects.toEqual(
-        new HubError("bad_request.prunable", "message would be pruned"),
-      );
-      await expect(timePrunedStore.merge(addOld2)).rejects.toEqual(
-        new HubError("bad_request.prunable", "message would be pruned"),
-      );
-
-      const result = await timePrunedStore.pruneMessages(fid);
-      expect(result.isOk()).toBeTruthy();
-
-      expect(prunedMessages).toEqual([]);
     });
   });
 });

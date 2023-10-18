@@ -1,10 +1,4 @@
-import {
-  FarcasterNetwork,
-  getInsecureHubRpcClient,
-  getSSLHubRpcClient,
-  HubInfoRequest,
-  SyncStatusRequest,
-} from "@farcaster/hub-nodejs";
+import { FarcasterNetwork } from "@farcaster/hub-nodejs";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { PeerId } from "@libp2p/interface-peer-id";
 import { createEd25519PeerId, createFromProtobuf, exportToProtobuf } from "@libp2p/peer-id-factory";
@@ -15,17 +9,24 @@ import { mkdir, readFile, writeFile } from "fs/promises";
 import { Result, ResultAsync } from "neverthrow";
 import { dirname, resolve } from "path";
 import { exit } from "process";
-import { APP_VERSION, Hub, HubOptions } from "./hubble.js";
+import { APP_VERSION, FARCASTER_VERSION, Hub, HubOptions, S3_REGION } from "./hubble.js";
 import { logger } from "./utils/logger.js";
-import { addressInfoFromParts, ipMultiAddrStrFromAddressInfo, parseAddress } from "./utils/p2p.js";
+import { addressInfoFromParts, hostPortFromString, ipMultiAddrStrFromAddressInfo, parseAddress } from "./utils/p2p.js";
 import { DEFAULT_RPC_CONSOLE, startConsole } from "./console/console.js";
 import RocksDB, { DB_DIRECTORY } from "./storage/db/rocksdb.js";
 import { parseNetwork } from "./utils/command.js";
-import { sleep } from "./utils/crypto.js";
 import { Config as DefaultConfig } from "./defaultConfig.js";
 import { profileStorageUsed } from "./profile/profile.js";
 import { profileRPCServer } from "./profile/rpcProfile.js";
 import { profileGossipServer } from "./profile/gossipProfile.js";
+import { initializeStatsd } from "./utils/statsd.js";
+import OnChainEventStore from "./storage/stores/onChainEventStore.js";
+import { startupCheck, StartupCheckStatus } from "./utils/startupCheck.js";
+import { mainnet, optimism } from "viem/chains";
+import { finishAllProgressBars } from "./utils/progressBars.js";
+import { MAINNET_BOOTSTRAP_PEERS } from "./bootstrapPeers.mainnet.js";
+import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
+import axios from "axios";
 
 /** A CLI to accept options from the user and start the Hub */
 
@@ -36,6 +37,7 @@ const DEFAULT_PEER_ID_LOCATION = `${DEFAULT_PEER_ID_DIR}/${DEFAULT_PEER_ID_FILEN
 const DEFAULT_CHUNK_SIZE = 10000;
 const DEFAULT_FNAME_SERVER_URL = "https://fnames.farcaster.xyz";
 
+const DEFAULT_HTTP_API_PORT = 2281;
 const DEFAULT_GOSSIP_PORT = 2282;
 const DEFAULT_RPC_PORT = 2283;
 
@@ -64,26 +66,23 @@ app
   // Hubble Options
   .option("-n --network <network>", "ID of the Farcaster Network (default: 3 (devnet))", parseNetwork)
   .option("-i, --id <filepath>", "Path to the PeerId file.")
+  .option("--hub-operator-fid <fid>", "The FID of the hub operator")
   .option("-c, --config <filepath>", "Path to the config file.")
   .option("--db-name <name>", "The name of the RocksDB instance. (default: rocks.hub._default)")
-  .option("--admin-server-enabled", "Enable the admin server. (default: disabled)")
-  .option("--admin-server-host <host>", "The host the admin server should listen on. (default: '127.0.0.1')")
   .option("--process-file-prefix <prefix>", 'Prefix for file to which hub process number is written. (default: "")')
 
   // Ethereum Options
   .option("-m, --eth-mainnet-rpc-url <url>", "RPC URL of a Mainnet ETH Node (or comma separated list of URLs)")
-  .option("-e, --eth-rpc-url <url>", "RPC URL of a Goerli ETH Node (or comma separated list of URLs)")
   .option("--rank-rpcs", "Rank the RPCs by latency/stability and use the fastest one (default: disabled)")
   .option("--fname-server-url <url>", `The URL for the FName registry server (default: ${DEFAULT_FNAME_SERVER_URL}`)
-  .option("--fir-address <address>", "The address of the Farcaster ID Registry contract")
-  .option("--first-block <number>", "The block number to begin syncing events from Farcaster contracts", parseNumber)
 
   // L2 Options
-  .option("-l, --l2-rpc-url <url>", "RPC URL of a Goerli Optimism Node (or comma separated list of URLs)")
+  .option("-l, --l2-rpc-url <url>", "RPC URL of a mainnet Optimism Node (or comma separated list of URLs)")
   .option("--l2-id-registry-address <address>", "The address of the L2 Farcaster ID Registry contract")
   .option("--l2-key-registry-address <address>", "The address of the L2 Farcaster Key Registry contract")
   .option("--l2-storage-registry-address <address>", "The address of the L2 Farcaster Storage Registry contract")
   .option("--l2-resync-events", "Resync events from the L2 Farcaster contracts before starting (default: disabled)")
+  .option("--l2-clear-events", "Deletes all events from the L2 Farcaster contracts before starting (default: disabled)")
   .option(
     "--l2-first-block <number>",
     "The block number to begin syncing events from L2 Farcaster contracts",
@@ -107,6 +106,8 @@ app
   .option("-b, --bootstrap <peer-multiaddrs...>", "Peers to bootstrap gossip and sync from. (default: none)")
   .option("-g, --gossip-port <port>", `Port to use for gossip (default: ${DEFAULT_GOSSIP_PORT})`)
   .option("-r, --rpc-port <port>", `Port to use for gRPC  (default: ${DEFAULT_RPC_PORT})`)
+  .option("-h, --http-api-port <port>", `Port to use for HTTP API (default: ${DEFAULT_HTTP_API_PORT})`)
+  .option("--http-cors-origin <origin>", "CORS origin for HTTP API (default: *)")
   .option("--ip <ip-address>", 'IP address to listen on (default: "127.0.0.1")')
   .option("--announce-ip <ip-address>", "Public IP address announced to peers (default: fetched with external service)")
   .option(
@@ -118,12 +119,29 @@ app
     "--rpc-rate-limit <number>",
     "RPC rate limit for peers specified in rpm. Set to -1 for none. (default: 20k/min)",
   )
+  .option("--rpc-subscribe-per-ip-limit <number>", "Maximum RPC subscriptions per IP address. (default: 4)")
+  .option("--admin-server-enabled", "Enable the admin server. (default: disabled)")
+  .option("--admin-server-host <host>", "The host the admin server should listen on. (default: '127.0.0.1')")
+  .option("--http-server-disabled", "Disable the HTTP server. (default: enabled)")
+
+  // Snapshots
+  .option("--enable-snapshot-to-s3", "Enable daily snapshots to be uploaded to S3. (default: disabled)")
+  .option("--s3-snapshot-bucket <bucket>", "The S3 bucket to upload snapshots to")
+  .option("--disable-snapshot-sync", "Disable syncing from snapshots. (default: enabled)")
+
+  // Metrics
+  .option(
+    "--statsd-metrics-server <host>",
+    'The host to send statsd metrics to, eg "127.0.0.1:8125". (default: disabled)',
+  )
 
   // Debugging options
-  .option("--gossip-metrics-enabled", "Generate tracing and metrics for the gossip network. (default: disabled)")
+  .option(
+    "--disable-console-status",
+    "Immediately log to STDOUT, and disable console status and progressbars. (default: disabled)",
+  )
   .option("--profile-sync", "Profile a full hub sync and exit. (default: disabled)")
   .option("--rebuild-sync-trie", "Rebuild the sync trie before starting (default: disabled)")
-  .option("--resync-eth-events", "Resync events from the Farcaster contracts before starting (default: disabled)")
   .option("--resync-name-events", "Resync events from the Fname server before starting (default: disabled)")
   .option(
     "--chunk-size <number>",
@@ -134,12 +152,11 @@ app
   .option("--commit-lock-max-pending <number>", "Rocks DB commit lock max pending jobs (default: 1000)", parseNumber)
   .option("--rpc-auth <username:password,...>", "Require username-password auth for RPC submit. (default: disabled)")
 
-  // To be deprecated
-  .option("--fnr-address <address>", "The address of the Farcaster Name Registry contract")
-
   .action(async (cliOptions) => {
     const handleShutdownSignal = (signalName: string) => {
-      logger.warn(`${signalName} received`);
+      logger.flush();
+
+      logger.warn(`signal '${signalName}' received`);
       if (!isExiting) {
         isExiting = true;
         hub
@@ -160,10 +177,23 @@ app
       }
     };
 
+    // Start the logger off in buffered mode
+    logger.$.startBuffering();
+
+    console.log("\n Hubble Startup Checks");
+    console.log("------------------------");
+
+    startupCheck.printStartupCheckStatus(
+      StartupCheckStatus.OK,
+      `Farcaster: ${FARCASTER_VERSION} Hubble: ${APP_VERSION}`,
+    );
+
     // We'll write our process number to a file so that we can detect if another hub process has taken over.
     const processFileDir = `${DB_DIRECTORY}/process/`;
     const processFilePrefix = cliOptions.processFilePrefix?.concat("_") ?? "";
     const processFileName = `${processFilePrefix}process_number.txt`;
+
+    startupCheck.directoryWritable(DB_DIRECTORY);
 
     // Generate a random number to identify this hub instance
     // Note that we can't use the PID as the identifier, since the hub running in a docker container will
@@ -203,18 +233,31 @@ app
     }, PROCESS_SHUTDOWN_FILE_CHECK_INTERVAL_MS);
 
     // try to load the config file
-    // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+    // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
     let hubConfig: any = DefaultConfig;
     if (cliOptions.config) {
       if (!cliOptions.config.endsWith(".js")) {
+        startupCheck.printStartupCheckStatus(StartupCheckStatus.ERROR, "Config file must be a .js file");
         throw new Error(`Config file ${cliOptions.config} must be a .js file`);
       }
 
       if (!fs.existsSync(resolve(cliOptions.config))) {
+        startupCheck.printStartupCheckStatus(
+          StartupCheckStatus.ERROR,
+          `Config file ${cliOptions.config} does not exist`,
+        );
         throw new Error(`Config file ${cliOptions.config} does not exist`);
       }
 
+      startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Loading config file ${cliOptions.config}`);
       hubConfig = (await import(resolve(cliOptions.config))).Config;
+    }
+
+    const disableConsoleStatus = cliOptions.disableConsoleStatus ?? hubConfig.disableConsoleStatus ?? false;
+    if (disableConsoleStatus) {
+      logger.info("Interactive Progress Bars disabled");
+      logger.flush();
+      finishAllProgressBars();
     }
 
     // Read PeerID from 1. CLI option, 2. Environment variable, 3. Config file
@@ -222,9 +265,12 @@ app
     if (cliOptions.id) {
       const peerIdR = await ResultAsync.fromPromise(readPeerId(resolve(cliOptions.id)), (e) => e);
       if (peerIdR.isErr()) {
-        throw new Error(
-          `Failed to read identity from ${cliOptions.id}: ${peerIdR.error}.\nPlease run "yarn identity create" to create a new identity.`,
+        startupCheck.printStartupCheckStatus(
+          StartupCheckStatus.ERROR,
+          `Failed to read identity from ${cliOptions.id}. Please run "yarn identity create".`,
+          "https://www.thehubble.xyz/intro/install.html#installing-hubble\n",
         );
+        process.exit(1);
       } else {
         peerId = peerIdR.value;
       }
@@ -232,7 +278,7 @@ app
       // Read from the environment variable
       const identityProtoBytes = Buffer.from(process.env["IDENTITY_B64"], "base64");
       const peerIdResult = await ResultAsync.fromPromise(createFromProtobuf(identityProtoBytes), (e) => {
-        return new Error(`Failed to read identity from environment: ${e}`);
+        throw new Error("Failed to read identity from environment");
       });
 
       if (peerIdResult.isErr()) {
@@ -242,15 +288,24 @@ app
       peerId = peerIdResult.value;
       logger.info({ identity: peerId.toString() }, "Read identity from environment");
     } else {
-      const peerIdR = await ResultAsync.fromPromise(readPeerId(resolve(hubConfig.id)), (e) => e);
+      const idFile = resolve(hubConfig.id ?? DEFAULT_PEER_ID_LOCATION);
+      startupCheck.directoryWritable(dirname(idFile));
+
+      const peerIdR = await ResultAsync.fromPromise(readPeerId(idFile), (e) => e);
       if (peerIdR.isErr()) {
-        throw new Error(
-          `Failed to read identity from ${cliOptions.id}: ${peerIdR.error}.\nPlease run "yarn identity create" to create a new identity.`,
+        startupCheck.printStartupCheckStatus(
+          StartupCheckStatus.ERROR,
+          `Failed to read identity from ${idFile}. Please run "yarn identity create".`,
+          "https://www.thehubble.xyz/intro/install.html#installing-hubble\n",
         );
+
+        process.exit(1);
       } else {
         peerId = peerIdR.value;
       }
     }
+
+    startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Found PeerId ${peerId.toString()}`);
 
     // Read RPC Auth from 1. CLI option, 2. Environment variable, 3. Config file
     let rpcAuth;
@@ -295,7 +350,31 @@ app
       }
     }
 
+    // Metrics
+    const statsDServer = cliOptions.statsdMetricsServer ?? hubConfig.statsdMetricsServer;
+    if (statsDServer) {
+      const server = hostPortFromString(statsDServer);
+      if (server.isErr()) {
+        logger.error({ err: server.error }, "Failed to parse statsd server. Statsd disabled");
+      } else {
+        logger.info({ server: server.value }, "Statsd server specified. Statsd enabled");
+        initializeStatsd(server.value.address, server.value.port);
+        startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, "Hubble Monitoring enabled");
+      }
+    } else {
+      startupCheck.printStartupCheckStatus(
+        StartupCheckStatus.WARNING,
+        "Hubble Monitoring is disabled",
+        "https://www.thehubble.xyz/intro/install.html#monitoring-hubble",
+      );
+      logger.info({}, "No statsd server specified. Statsd disabled");
+    }
+
     const network = cliOptions.network ?? hubConfig.network;
+    startupCheck.printStartupCheckStatus(
+      StartupCheckStatus.OK,
+      `Network is ${FarcasterNetwork[network]?.toString()}(${network})`,
+    );
 
     let testUsers;
     if (process.env["TEST_USERS"]) {
@@ -329,7 +408,11 @@ app
       throw ipMultiAddrResult.error;
     }
 
-    const bootstrapAddrs = ((cliOptions.bootstrap ?? hubConfig.bootstrap ?? []) as string[])
+    const bootstrapAddrs = (
+      (cliOptions.bootstrap ??
+        hubConfig.bootstrap ??
+        (network === FarcasterNetwork.MAINNET ? MAINNET_BOOTSTRAP_PEERS : [])) as string[]
+    )
       .map((a) => parseAddress(a))
       .map((a) => {
         if (a.isErr()) {
@@ -342,6 +425,15 @@ app
       })
       .filter((a) => a.isOk())
       .map((a) => a._unsafeUnwrap());
+    if (bootstrapAddrs.length > 0) {
+      startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Bootstrapping from ${bootstrapAddrs.length} peers`);
+    } else {
+      startupCheck.printStartupCheckStatus(
+        StartupCheckStatus.WARNING,
+        "No bootstrap peers specified. Hubble will not be able to sync without them.",
+        "https://www.thehubble.xyz/intro/networks.html",
+      );
+    }
 
     const directPeers = ((cliOptions.directPeers ?? hubConfig.directPeers ?? []) as string[])
       .map((a) => parseAddress(a))
@@ -372,6 +464,13 @@ app
     const rebuildSyncTrie = cliOptions.rebuildSyncTrie ?? hubConfig.rebuildSyncTrie ?? false;
     const profileSync = cliOptions.profileSync ?? hubConfig.profileSync ?? false;
 
+    let enableSnapshotToS3 = cliOptions.enableSnapshotToS3 ?? hubConfig.enableSnapshotToS3 ?? false;
+    if (enableSnapshotToS3) {
+      // If we're uploading snapshots to S3, we need to make sure that the S3 credentials are set
+      const awsVerified = await verifyAWSCredentials();
+      enableSnapshotToS3 = awsVerified;
+    }
+
     const options: HubOptions = {
       peerId,
       ipMultiAddr: ipMultiAddrResult.value,
@@ -380,13 +479,9 @@ app
       announceServerName: cliOptions.announceServerName ?? hubConfig.announceServerName,
       gossipPort: hubAddressInfo.value.port,
       network,
-      ethRpcUrl: cliOptions.ethRpcUrl ?? hubConfig.ethRpcUrl,
       ethMainnetRpcUrl: cliOptions.ethMainnetRpcUrl ?? hubConfig.ethMainnetRpcUrl,
       fnameServerUrl: cliOptions.fnameServerUrl ?? hubConfig.fnameServerUrl ?? DEFAULT_FNAME_SERVER_URL,
       rankRpcs: cliOptions.rankRpcs ?? hubConfig.rankRpcs ?? false,
-      idRegistryAddress: cliOptions.firAddress ?? hubConfig.firAddress,
-      nameRegistryAddress: cliOptions.fnrAddress ?? hubConfig.fnrAddress,
-      firstBlock: cliOptions.firstBlock ?? hubConfig.firstBlock,
       chunkSize: cliOptions.chunkSize ?? hubConfig.chunkSize ?? DEFAULT_CHUNK_SIZE,
       l2RpcUrl: cliOptions.l2RpcUrl ?? hubConfig.l2RpcUrl,
       l2IdRegistryAddress: cliOptions.l2IdRegistryAddress ?? hubConfig.l2IdRegistryAddress,
@@ -396,37 +491,113 @@ app
       l2ChunkSize: cliOptions.l2ChunkSize ?? hubConfig.l2ChunkSize,
       l2ChainId: cliOptions.l2ChainId ?? hubConfig.l2ChainId,
       l2ResyncEvents: cliOptions.l2ResyncEvents ?? hubConfig.l2ResyncEvents ?? false,
+      l2ClearEvents: cliOptions.l2ClearEvents ?? hubConfig.l2ClearEvents ?? false,
       l2RentExpiryOverride: cliOptions.l2RentExpiryOverride ?? hubConfig.l2RentExpiryOverride,
       bootstrapAddrs,
       allowedPeers: cliOptions.allowedPeers ?? hubConfig.allowedPeers,
       deniedPeers: cliOptions.deniedPeers ?? hubConfig.deniedPeers,
       rpcPort: cliOptions.rpcPort ?? hubConfig.rpcPort ?? DEFAULT_RPC_PORT,
+      httpApiPort: cliOptions.httpApiPort ?? hubConfig.httpApiPort ?? DEFAULT_HTTP_API_PORT,
+      httpCorsOrigin: cliOptions.httpCorsOrigin ?? hubConfig.httpCorsOrigin ?? "*",
       rpcAuth,
       rpcRateLimit,
+      rpcSubscribePerIpLimit: cliOptions.rpcSubscribePerIpLimit ?? hubConfig.rpcSubscribePerIpLimit,
       rocksDBName: cliOptions.dbName ?? hubConfig.dbName,
       resetDB,
       rebuildSyncTrie,
       profileSync,
-      resyncEthEvents: cliOptions.resyncEthEvents ?? hubConfig.resyncEthEvents ?? false,
       resyncNameEvents: cliOptions.resyncNameEvents ?? hubConfig.resyncNameEvents ?? false,
       commitLockTimeout: cliOptions.commitLockTimeout ?? hubConfig.commitLockTimeout,
       commitLockMaxPending: cliOptions.commitLockMaxPending ?? hubConfig.commitLockMaxPending,
       adminServerEnabled: cliOptions.adminServerEnabled ?? hubConfig.adminServerEnabled,
+      httpServerDisabled: cliOptions.httpServerDisabled ?? hubConfig.httpServerDisabled ?? false,
       adminServerHost: cliOptions.adminServerHost ?? hubConfig.adminServerHost,
       testUsers: testUsers,
-      gossipMetricsEnabled: cliOptions.gossipMetricsEnabled ?? false,
       directPeers,
+      disableSnapshotSync: cliOptions.disableSnapshotSync ?? hubConfig.disableSnapshotSync ?? false,
+      enableSnapshotToS3,
+      s3SnapshotBucket: cliOptions.s3SnapshotBucket ?? hubConfig.s3SnapshotBucket,
+      hubOperatorFid: parseInt(cliOptions.hubOperatorFid ?? hubConfig.hubOperatorFid),
     };
+
+    // Startup check for Hub Operator FID
+    if (options.hubOperatorFid && !isNaN(options.hubOperatorFid)) {
+      try {
+        const fid = options.hubOperatorFid;
+        const response = await axios.get(`https://fnames.farcaster.xyz/transfers?fid=${fid}`);
+        const transfers = response.data.transfers;
+        if (transfers && transfers.length > 0) {
+          const usernameField = transfers[transfers.length - 1].username;
+          if (usernameField !== null && usernameField !== undefined) {
+            startupCheck.printStartupCheckStatus(StartupCheckStatus.OK, `Hub Operator FID is ${fid}(${usernameField})`);
+          } else {
+            startupCheck.printStartupCheckStatus(
+              StartupCheckStatus.WARNING,
+              `Hub Operator FID is ${fid}, but no username was found`,
+            );
+          }
+        }
+      } catch (e) {
+        logger.error(e, `Error fetching username for Hub Operator FID ${options.hubOperatorFid}`);
+        startupCheck.printStartupCheckStatus(
+          StartupCheckStatus.WARNING,
+          `Hub Operator FID is ${options.hubOperatorFid}, but no username was found`,
+        );
+      }
+    } else {
+      startupCheck.printStartupCheckStatus(
+        StartupCheckStatus.WARNING,
+        "Hub Operator FID is not set",
+        "https://www.thehubble.xyz/intro/install.html#troubleshooting",
+      );
+    }
+
+    if (options.enableSnapshotToS3) {
+      // Set the Hub to exit (and be automatically restarted) so that the snapshot is uploaded
+      // before the Hub starts syncing
+      // Calculate and set a timeout to run at 9:10 am UTC (2:10 am PST)
+      const millisTill9 = millisTillRestart();
+      logger.info({ millisTill9 }, "Scheduling Hub to exit at 9:10 am UTC to upload snapshot to S3");
+
+      setTimeout(async () => {
+        logger.info("Exiting Hub to upload snapshot to S3");
+        handleShutdownSignal("S3SnapshotUpload");
+      }, millisTill9);
+    }
+
+    await startupCheck.rpcCheck(options.ethMainnetRpcUrl, mainnet, "L1");
+    await startupCheck.rpcCheck(options.l2RpcUrl, optimism, "L2", options.l2ChainId);
+
+    if (startupCheck.anyFailedChecks()) {
+      logger.fatal({ reason: "Startup checks failed" }, "shutting down hub");
+      logger.flush();
+      process.exit(1);
+    }
 
     const hubResult = Result.fromThrowable(
       () => new Hub(options),
       (e) => new Error(`Failed to create hub: ${e}`),
     )();
     if (hubResult.isErr()) {
-      logger.fatal(hubResult.error);
-      logger.fatal({ reason: "Hub Creation failed" }, "shutting down hub");
+      if (!startupCheck.anyFailedChecks()) {
+        logger.fatal(hubResult.error);
+        logger.fatal({ reason: "Hub Creation failed" }, "shutting down hub");
 
+        logger.flush();
+      }
       process.exit(1);
+    }
+
+    if (statsDServer && !disableConsoleStatus) {
+      console.log("\nMonitor Your Node");
+      console.log("----------------");
+      console.log("🔗 | Grafana at http://localhost:3000");
+    }
+
+    if (!disableConsoleStatus) {
+      console.log("\n Starting Hubble");
+      console.log("------------------");
+      console.log("Please wait... This may take several minutes");
     }
 
     const hub = hubResult.value;
@@ -440,6 +611,7 @@ app
       try {
         await hub.teardown();
       } finally {
+        logger.flush();
         process.exit(1);
       }
     }
@@ -459,15 +631,13 @@ app
     });
 
     process.on("uncaughtException", (err) => {
-      logger.error({ reason: "Uncaught exception" }, "shutting down hub");
-      logger.fatal(err);
+      logger.error({ reason: "Uncaught exception", err }, "shutting down hub");
 
       handleShutdownSignal("uncaughtException");
     });
 
     process.on("unhandledRejection", (err) => {
-      logger.error({ reason: "Unhandled Rejection" }, "shutting down hub");
-      logger.fatal(err);
+      logger.error({ reason: "Unhandled Rejection", err }, "shutting down hub");
 
       handleShutdownSignal("unhandledRejection");
     });
@@ -489,7 +659,7 @@ const writePeerId = async (peerId: PeerId, filepath: string) => {
       await mkdir(directory, { recursive: true });
     }
     await writeFile(filepath, proto, "binary");
-    // rome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
+    // biome-ignore lint/suspicious/noExplicitAny: legacy code, avoid using ignore for new code
   } catch (err: any) {
     throw new Error(err);
   }
@@ -536,7 +706,7 @@ app
 /*//////////////////////////////////////////////////////////////
                           STATUS COMMAND
 //////////////////////////////////////////////////////////////*/
-
+// Deprecated. Please use grafana monitoring instead.
 app
   .command("status")
   .description("Reports the db and sync status of the hub")
@@ -548,71 +718,17 @@ app
   .option("--insecure", "Allow insecure connections to the RPC server", false)
   .option("--watch", "Keep running and periodically report status", false)
   .option("-p, --peerId <peerId>", "Peer id of the hub to compare with (defaults to bootstrap peers)")
-  .action(async (cliOptions) => {
-    let rpcClient;
-    if (cliOptions.insecure) {
-      rpcClient = getInsecureHubRpcClient(cliOptions.server);
-    } else {
-      rpcClient = getSSLHubRpcClient(cliOptions.server);
-    }
-    const infoResult = await rpcClient.getInfo(HubInfoRequest.create({ dbStats: true }));
-    if (infoResult.isErr()) {
-      logger.error(
-        { errCode: infoResult.error.errCode, errMsg: infoResult.error.message },
-        "Failed to get hub status. Do you need to pass in --insecure?",
-      );
-      exit(1);
-    }
-    const dbStats = infoResult.value.dbStats;
-    logger.info(
-      `Hub Version: ${infoResult.value.version} Messages: ${dbStats?.numMessages} FIDs: ${dbStats?.numFidEvents} FNames: ${dbStats?.numFnameEvents}}`,
+  .action(async (_cliOptions) => {
+    logger.error(
+      "DEPRECATED:" +
+        "The 'status' command has been deprecated." +
+        "Please use Grafana monitoring. See https://www.thehubble.xyz/intro/monitoring.html",
     );
-    for (;;) {
-      const syncResult = await rpcClient.getSyncStatus(SyncStatusRequest.create({ peerId: cliOptions.peerId }));
-      if (syncResult.isErr()) {
-        logger.error(
-          { errCode: syncResult.error.errCode, errMsg: syncResult.error.message },
-          "Failed to get sync status",
-        );
-        exit(1);
-      }
-
-      let isSyncing = false;
-      const syncEngingStarted = syncResult.value.engineStarted;
-      const msgPercents: number[] = [];
-      for (const peerStatus of syncResult.value.syncStatus) {
-        if (peerStatus.theirMessages === 0) {
-          continue;
-        }
-        const messagePercent = (peerStatus.ourMessages / peerStatus.theirMessages) * 100;
-        msgPercents.push(messagePercent);
-        if (syncResult.value.isSyncing) {
-          isSyncing = true;
-        }
-      }
-
-      const numPeers = msgPercents.length;
-      if (!syncEngingStarted) {
-        logger.info("Sync Status: Getting blockchain events (Sync not started yet)");
-      } else if (numPeers === 0) {
-        logger.info("Sync Status: No peers");
-      } else {
-        const avgMsgPercent = msgPercents.reduce((a, b) => a + b, 0) / numPeers;
-        if (isSyncing) {
-          logger.info(
-            `Sync Status: Sync in progress. Hub has ${avgMsgPercent.toFixed(2)}% of messages of ${numPeers} peers`,
-          );
-        } else {
-          logger.info(`Sync Status: Hub has ${avgMsgPercent.toFixed(2)}% of messages of ${numPeers} peers`);
-        }
-      }
-
-      if (!cliOptions.watch) {
-        break;
-      }
-
-      await sleep(10_000);
-    }
+    console.error(
+      "DEPRECATED:\n" +
+        "The 'status' command has been deprecated\n" +
+        "Please use Grafana monitoring. See https://www.thehubble.xyz/intro/monitoring.html\n",
+    );
     exit(0);
   });
 
@@ -729,3 +845,34 @@ const readPeerId = async (filePath: string) => {
 };
 
 app.parse(process.argv);
+
+///////////////////////////////////////////////////////////////
+//                        UTILS
+///////////////////////////////////////////////////////////////
+function millisTillRestart(): number {
+  // Calculate the number of milliseconds until 9:10 am UTC (2:10 am PST)
+  const now = new Date();
+  const timeAt9 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 9, 10, 0, 0).getTime();
+
+  const millisTill9Tomorrow = timeAt9 + 24 * 60 * 60 * 1000 - now.getTime();
+  const millisTill9Today = timeAt9 - now.getTime();
+
+  return millisTill9Today > 0 ? millisTill9Today : millisTill9Tomorrow;
+}
+
+// Verify that we have access to the AWS credentials.
+// Either via environment variables or via the AWS credentials file
+async function verifyAWSCredentials(): Promise<boolean> {
+  const sts = new STSClient({ region: S3_REGION });
+
+  try {
+    const identity = await sts.send(new GetCallerIdentityCommand({}));
+
+    logger.info({ accountId: identity.Account }, "Verified AWS credentials");
+
+    return true;
+  } catch (error) {
+    logger.error({ err: error }, "Failed to verify AWS credentials. No S3 snapshot upload will be performed.");
+    return false;
+  }
+}

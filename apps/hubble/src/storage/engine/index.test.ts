@@ -8,10 +8,6 @@ import {
   FarcasterNetwork,
   hexStringToBytes,
   HubError,
-  HubEvent,
-  HubEventType,
-  IdRegistryEvent,
-  IdRegistryEventType,
   LinkAddMessage,
   MergeMessageHubEvent,
   MergeUserNameProofBody,
@@ -19,15 +15,12 @@ import {
   Message,
   MessageData,
   MessageType,
-  NameRegistryEvent,
-  NameRegistryEventType,
-  PruneMessageHubEvent,
+  OnChainEvent,
+  OnChainEventType,
   ReactionAddMessage,
   ReactionType,
   RevokeMessageHubEvent,
-  SignerAddMessage,
   SignerEventType,
-  SignerRemoveMessage,
   toFarcasterTime,
   UserDataAddMessage,
   UserDataType,
@@ -39,23 +32,18 @@ import {
 import { err, Ok, ok } from "neverthrow";
 import { jestRocksDB } from "../db/jestUtils.js";
 import Engine from "../engine/index.js";
-import SignerStore from "../stores/signerStore.js";
 import { sleep } from "../../utils/crypto.js";
 import { getMessage, makeTsHash, typeToSetPostfix } from "../db/message.js";
 import { StoreEvents } from "../stores/storeEventHandler.js";
-import { makeVerificationEthAddressClaim } from "@farcaster/core";
+import { IdRegisterOnChainEvent, makeVerificationEthAddressClaim } from "@farcaster/core";
 import { setReferenceDateForTest } from "../../utils/versions.js";
 import { getUserNameProof } from "../db/nameRegistryEvent.js";
 import { publicClient } from "../../test/utils.js";
 import { jest } from "@jest/globals";
-import { RevokeMessagesBySignerJobQueue, RevokeMessagesBySignerJobWorker } from "../jobs/revokeMessagesBySignerJob.js";
 
 const db = jestRocksDB("protobufs.engine.test");
 const network = FarcasterNetwork.TESTNET;
 const engine = new Engine(db, network, undefined, publicClient);
-
-// init signer store for checking state changes from engine
-const signerStore = new SignerStore(db, engine.eventHandler);
 
 const fid = Factories.Fid.build();
 const fname = Factories.Fname.build();
@@ -64,11 +52,11 @@ const custodySigner = Factories.Eip712Signer.build();
 
 let custodySignerKey: Uint8Array;
 let signerKey: Uint8Array;
-let custodyEvent: IdRegistryEvent;
-let fnameTransfer: NameRegistryEvent;
 let userNameProof: UserNameProof;
-let signerAdd: SignerAddMessage;
-let signerRemove: SignerRemoveMessage;
+let custodyEvent: IdRegisterOnChainEvent;
+let storageEvent: OnChainEvent;
+let signerAddEvent: OnChainEvent;
+let signerRemoveEvent: OnChainEvent;
 let castAdd: CastAddMessage;
 let reactionAdd: ReactionAddMessage;
 let linkAdd: LinkAddMessage;
@@ -78,19 +66,19 @@ let userDataAdd: UserDataAddMessage;
 beforeAll(async () => {
   signerKey = (await signer.getSignerKey())._unsafeUnwrap();
   custodySignerKey = (await custodySigner.getSignerKey())._unsafeUnwrap();
-  custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySignerKey });
+  custodyEvent = Factories.IdRegistryOnChainEvent.build({ fid }, { transient: { to: custodySignerKey } });
+  signerAddEvent = Factories.SignerOnChainEvent.build({ fid }, { transient: { signer: signerKey } });
+  signerRemoveEvent = Factories.SignerOnChainEvent.build({
+    fid,
+    blockNumber: signerAddEvent.blockNumber + 1,
+    signerEventBody: Factories.SignerEventBody.build({
+      eventType: SignerEventType.REMOVE,
+      key: signerKey,
+    }),
+  });
+  storageEvent = Factories.StorageRentOnChainEvent.build({ fid });
 
-  fnameTransfer = Factories.NameRegistryEvent.build({ fname, to: custodyEvent.to });
-  userNameProof = Factories.UserNameProof.build({ name: fname, owner: custodyEvent.to, fid: fid });
-
-  signerAdd = await Factories.SignerAddMessage.create(
-    { data: { fid, network, signerAddBody: { signer: signerKey } } },
-    { transient: { signer: custodySigner } },
-  );
-  signerRemove = await Factories.SignerRemoveMessage.create(
-    { data: { fid, network, timestamp: signerAdd.data.timestamp + 1, signerRemoveBody: { signer: signerKey } } },
-    { transient: { signer: custodySigner } },
-  );
+  userNameProof = Factories.UserNameProof.build({ name: fname, owner: custodyEvent.idRegisterEventBody.to, fid: fid });
 
   castAdd = await Factories.CastAddMessage.create({ data: { fid, network } }, { transient: { signer } });
   reactionAdd = await Factories.ReactionAddMessage.create({ data: { fid, network } }, { transient: { signer } });
@@ -105,29 +93,16 @@ beforeAll(async () => {
   );
 });
 
-describe("mergeIdRegistryEvent", () => {
+describe("mergeOnChainEvent", () => {
   test("succeeds", async () => {
-    await expect(engine.mergeIdRegistryEvent(custodyEvent)).resolves.toBeInstanceOf(Ok);
-    await expect(engine.getIdRegistryEvent(fid)).resolves.toEqual(ok(custodyEvent));
+    await expect(engine.mergeOnChainEvent(custodyEvent)).resolves.toBeInstanceOf(Ok);
+    await expect(engine.getIdRegistryOnChainEvent(fid)).resolves.toEqual(ok(custodyEvent));
   });
 
-  test("fails with invalid event type", async () => {
-    const invalidEvent = Factories.IdRegistryEvent.build({ type: 10 as unknown as IdRegistryEventType });
-    const result = await engine.mergeIdRegistryEvent(invalidEvent);
-    expect(result._unsafeUnwrapErr()).toEqual(new HubError("bad_request.validation_failure", "invalid event type"));
-  });
-});
-
-describe("mergeNameRegistryEvent", () => {
-  test("succeeds", async () => {
-    await expect(engine.mergeNameRegistryEvent(fnameTransfer)).resolves.toBeInstanceOf(Ok);
-    await expect(engine.getNameRegistryEvent(fname)).resolves.toEqual(ok(fnameTransfer));
-  });
-
-  test("fails with invalid event type", async () => {
-    const invalidEvent = Factories.NameRegistryEvent.build({ type: 10 as unknown as NameRegistryEventType });
-    const result = await engine.mergeNameRegistryEvent(invalidEvent);
-    expect(result._unsafeUnwrapErr()).toEqual(new HubError("bad_request.validation_failure", "invalid event type"));
+  test("does not merge invalid event type", async () => {
+    const event = Factories.OnChainEvent.build({ type: OnChainEventType.EVENT_TYPE_NONE });
+    const result = await engine.mergeOnChainEvent(event);
+    expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
   });
 });
 
@@ -160,15 +135,16 @@ describe("mergeMessage", () => {
 
   describe("with valid signer", () => {
     beforeEach(async () => {
-      await expect(engine.mergeIdRegistryEvent(custodyEvent)).resolves.toBeInstanceOf(Ok);
-      await expect(engine.mergeMessage(signerAdd)).resolves.toBeInstanceOf(Ok);
+      await engine.mergeOnChainEvent(custodyEvent);
+      await engine.mergeOnChainEvent(signerAddEvent);
+      await engine.mergeOnChainEvent(storageEvent);
     });
 
     describe("CastAdd", () => {
       test("succeeds", async () => {
         await expect(engine.mergeMessage(castAdd)).resolves.toBeInstanceOf(Ok);
         await expect(engine.getCast(fid, castAdd.hash)).resolves.toEqual(ok(castAdd));
-        expect(mergedMessages).toEqual([signerAdd, castAdd]);
+        expect(mergedMessages).toEqual([castAdd]);
       });
     });
 
@@ -182,7 +158,7 @@ describe("mergeMessage", () => {
             reactionAdd.data.reactionBody.targetCastId as CastId,
           ),
         ).resolves.toEqual(ok(reactionAdd));
-        expect(mergedMessages).toEqual([signerAdd, reactionAdd]);
+        expect(mergedMessages).toEqual([reactionAdd]);
       });
     });
 
@@ -193,7 +169,7 @@ describe("mergeMessage", () => {
         await expect(
           engine.getLink(fid, linkAdd.data.linkBody.type, linkAdd.data.linkBody.targetFid as number),
         ).resolves.toEqual(ok(linkAdd));
-        expect(mergedMessages).toEqual([signerAdd, linkAdd]);
+        expect(mergedMessages).toEqual([linkAdd]);
       });
     });
 
@@ -203,7 +179,7 @@ describe("mergeMessage", () => {
         await expect(
           engine.getVerification(fid, verificationAdd.data.verificationAddEthAddressBody.address),
         ).resolves.toEqual(ok(verificationAdd));
-        expect(mergedMessages).toEqual([signerAdd, verificationAdd]);
+        expect(mergedMessages).toEqual([verificationAdd]);
       });
 
       test("fails when network does not match claim network", async () => {
@@ -228,9 +204,70 @@ describe("mergeMessage", () => {
         );
         const result = await engine.mergeMessage(testnetVerificationAdd);
         // Signature will not match because we're attempting to recover the address based on the wrong network
-        expect(result).toEqual(
-          err(new HubError("bad_request.validation_failure", "ethSignature does not match address")),
-        );
+        expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid ethSignature")));
+      });
+
+      describe("validateOrRevokeMessage", () => {
+        let mergedMessage: Message;
+        let verifications: VerificationAddEthAddressMessage[] = [];
+
+        const getVerifications = async () => {
+          const verificationsResult = await engine.getVerificationsByFid(fid);
+          if (verificationsResult.isOk()) {
+            verifications = verificationsResult.value.messages;
+          }
+        };
+
+        const createVerification = async () => {
+          return await Factories.VerificationAddEthAddressMessage.create(
+            {
+              data: {
+                fid,
+                verificationAddEthAddressBody: Factories.VerificationAddEthAddressBody.build({
+                  chainId: 1,
+                  verificationType: 1,
+                }),
+              },
+            },
+            { transient: { signer } },
+          );
+        };
+
+        beforeEach(async () => {
+          jest.replaceProperty(publicClient.chain, "id", 1);
+          jest.spyOn(publicClient, "verifyTypedData").mockResolvedValue(true);
+          mergedMessage = await createVerification();
+          const result = await engine.mergeMessage(mergedMessage);
+          expect(result.isOk()).toBeTruthy();
+          await getVerifications();
+          expect(verifications.length).toBe(1);
+        });
+
+        afterEach(async () => {
+          jest.restoreAllMocks();
+        });
+
+        test("revokes a contract verification when signature is no longer valid", async () => {
+          jest.spyOn(publicClient, "verifyTypedData").mockResolvedValue(false);
+          const result = await engine.validateOrRevokeMessage(mergedMessage);
+          expect(result.isOk()).toBeTruthy();
+
+          const verificationsResult = await engine.getVerificationsByFid(fid);
+          expect(verificationsResult.isOk()).toBeTruthy();
+
+          await getVerifications();
+          expect(verifications.length).toBe(0);
+        });
+
+        test("does not revoke contract verifications when RPC call fails", async () => {
+          jest.spyOn(publicClient, "verifyTypedData").mockRejectedValue(new Error("verify failed"));
+          const result = await engine.validateOrRevokeMessage(mergedMessage);
+          expect(result._unsafeUnwrapErr().errCode).toEqual("unavailable.network_failure");
+          expect(result._unsafeUnwrapErr().message).toMatch("verify failed");
+
+          await getVerifications();
+          expect(verifications.length).toBe(1);
+        });
       });
     });
 
@@ -238,7 +275,7 @@ describe("mergeMessage", () => {
       test("succeeds", async () => {
         await expect(engine.mergeMessage(userDataAdd)).resolves.toBeInstanceOf(Ok);
         await expect(engine.getUserData(fid, userDataAdd.data.userDataBody.type)).resolves.toEqual(ok(userDataAdd));
-        expect(mergedMessages).toEqual([signerAdd, userDataAdd]);
+        expect(mergedMessages).toEqual([userDataAdd]);
       });
 
       describe("with fname", () => {
@@ -293,14 +330,6 @@ describe("mergeMessage", () => {
           expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
           expect(result._unsafeUnwrapErr().message).toMatch("does not match");
         });
-      });
-    });
-
-    describe("SignerRemove", () => {
-      test("succeeds ", async () => {
-        await expect(engine.mergeMessage(signerRemove)).resolves.toBeInstanceOf(Ok);
-        await expect(signerStore.getSignerRemove(fid, signerKey)).resolves.toEqual(signerRemove);
-        expect(mergedMessages).toEqual([signerAdd, signerRemove]);
       });
     });
 
@@ -411,15 +440,10 @@ describe("mergeMessage", () => {
   });
 
   describe("fails when signer is invalid", () => {
-    test("with SignerAdd", async () => {
-      await engine.mergeIdRegistryEvent(Factories.IdRegistryEvent.build({ fid }));
-      const result = await engine.mergeMessage(signerAdd);
-      expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
-      expect(result._unsafeUnwrapErr().message).toMatch("invalid signer");
-    });
-
     test("with ReactionAdd", async () => {
-      await engine.mergeIdRegistryEvent(custodyEvent);
+      await engine.mergeOnChainEvent(custodyEvent);
+      await engine.mergeOnChainEvent(Factories.SignerOnChainEvent.build({ fid }));
+
       const result = await engine.mergeMessage(reactionAdd);
       expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
       expect(result._unsafeUnwrapErr().message).toMatch("invalid signer");
@@ -427,7 +451,9 @@ describe("mergeMessage", () => {
 
     test("with LinkAdd", async () => {
       setReferenceDateForTest(100000000000000000000000);
-      await engine.mergeIdRegistryEvent(custodyEvent);
+      await engine.mergeOnChainEvent(custodyEvent);
+      await engine.mergeOnChainEvent(Factories.SignerOnChainEvent.build({ fid }));
+
       const result = await engine.mergeMessage(linkAdd);
       expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
       expect(result._unsafeUnwrapErr().message).toMatch("invalid signer");
@@ -478,8 +504,9 @@ describe("mergeMessage", () => {
 
     beforeEach(async () => {
       usernameProofEvents = [];
-      await engine.mergeIdRegistryEvent(custodyEvent);
-      await engine.mergeMessage(signerAdd);
+      await engine.mergeOnChainEvent(custodyEvent);
+      await engine.mergeOnChainEvent(signerAddEvent);
+      await engine.mergeOnChainEvent(storageEvent);
       await engine.eventHandler.syncCache();
       engine.eventHandler.on("mergeUsernameProofEvent", handleUsernameProofEvent);
     });
@@ -517,11 +544,13 @@ describe("mergeMessage", () => {
       expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
       expect(result._unsafeUnwrapErr().message).toMatch("invalid ens name");
     });
+
     test("fails gracefully when resolving throws an error", async () => {
       const result = await engine.mergeMessage(await createProof("test.eth"));
       expect(result).toMatchObject(err({ errCode: "unavailable.network_failure" }));
       expect(result._unsafeUnwrapErr().message).toMatch("failed to resolve ens name");
     });
+
     test("fails gracefully when resolving an unregistered name", async () => {
       jest.spyOn(publicClient, "getEnsAddress").mockImplementation(() => {
         return Promise.resolve(null);
@@ -530,6 +559,7 @@ describe("mergeMessage", () => {
       expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
       expect(result._unsafeUnwrapErr().message).toMatch("no valid address for akjsdhkhaasd.eth");
     });
+
     test("fails when resolved address does not match proof", async () => {
       const message = await createProof("test.eth");
       jest.spyOn(publicClient, "getEnsAddress").mockImplementation(() => {
@@ -539,6 +569,7 @@ describe("mergeMessage", () => {
       expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
       expect(result._unsafeUnwrapErr().message).toMatch(`resolved address ${randomEthAddress} does not match proof`);
     });
+
     test("fails when resolved address does not match custody address or verification address", async () => {
       await engine.mergeMessage(verificationAdd);
       jest.spyOn(publicClient, "getEnsAddress").mockImplementation(() => {
@@ -549,8 +580,9 @@ describe("mergeMessage", () => {
       expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
       expect(result._unsafeUnwrapErr().message).toMatch("ens name does not belong to fid");
     });
+
     test("succeeds for valid proof for custody address", async () => {
-      const custodyAddress = bytesToHexString(custodyEvent.to)._unsafeUnwrap();
+      const custodyAddress = bytesToHexString(custodyEvent.idRegisterEventBody.to)._unsafeUnwrap();
       jest.spyOn(publicClient, "getEnsAddress").mockImplementation(() => {
         return Promise.resolve(custodyAddress);
       });
@@ -562,6 +594,7 @@ describe("mergeMessage", () => {
       expect(usernameProofEvents[0]?.usernameProof).toMatchObject(message.data.usernameProofBody);
       expect(usernameProofEvents[0]?.deletedUsernameProof).toBeUndefined();
     });
+
     test("succeeds for valid proof for verified eth address", async () => {
       await engine.mergeMessage(verificationAdd);
       const verificationAddress = bytesToHexString(
@@ -579,12 +612,35 @@ describe("mergeMessage", () => {
       expect(usernameProofEvents[0]?.deletedUsernameProof).toBeUndefined();
     });
 
+    test("getUsernameProofsByFid returns all proofs for fid including fname proofs", async () => {
+      const custodyAddress = bytesToHexString(custodyEvent.idRegisterEventBody.to)._unsafeUnwrap();
+      jest.spyOn(publicClient, "getEnsAddress").mockImplementation(() => {
+        return Promise.resolve(custodyAddress);
+      });
+      const message = await createProof("test.eth", null, custodyAddress);
+      const result = await engine.mergeMessage(message);
+      expect(result.isOk()).toBeTruthy();
+
+      const fnameProof = Factories.UserNameProof.build({ fid });
+      await engine.mergeUserNameProof(fnameProof);
+
+      const proofs = (await engine.getUserNameProofsByFid(fid)).unwrapOr([]);
+      expect(proofs.length).toBe(2);
+      expect(proofs).toContainEqual(message.data.usernameProofBody);
+      expect(proofs).toContainEqual(fnameProof);
+    });
+
+    test("getUsernameProofsByFid does not fail for empty results", async () => {
+      const proofs = (await engine.getUserNameProofsByFid(fid)).unwrapOr([]);
+      expect(proofs.length).toBe(0);
+    });
+
     describe("userDataAdd message with an ens name", () => {
       let test1Message: Message;
       let userDataAdd: Message;
       let userDataAdd2: Message;
       beforeEach(async () => {
-        const custodyAddress = bytesToHexString(custodyEvent.to)._unsafeUnwrap();
+        const custodyAddress = bytesToHexString(custodyEvent.idRegisterEventBody.to)._unsafeUnwrap();
         const verificationAddress = bytesToHexString(
           verificationAdd.data.verificationAddEthAddressBody.address,
         )._unsafeUnwrap();
@@ -695,7 +751,7 @@ describe("mergeMessage", () => {
     describe("validateOrRevokeMessage", () => {
       let mergedMessage: Message;
       beforeEach(async () => {
-        const custodyAddress = bytesToHexString(custodyEvent.to)._unsafeUnwrap();
+        const custodyAddress = bytesToHexString(custodyEvent.idRegisterEventBody.to)._unsafeUnwrap();
         jest.spyOn(publicClient, "getEnsAddress").mockImplementation(() => {
           return Promise.resolve(custodyAddress);
         });
@@ -728,70 +784,6 @@ describe("mergeMessage", () => {
       });
     });
   });
-
-  describe("signer migration", () => {
-    let migratedEngine: Engine;
-    describe("after migration", () => {
-      beforeEach(async () => {
-        // Create a new instance so the isMigrated flag is cleared each time.
-        migratedEngine = new Engine(db, network, undefined, publicClient);
-
-        await expect(migratedEngine.mergeIdRegistryEvent(custodyEvent)).resolves.toBeInstanceOf(Ok);
-        await expect(migratedEngine.mergeMessage(signerAdd)).resolves.toBeInstanceOf(Ok);
-        await migratedEngine.mergeOnChainEvent(Factories.SignerMigratedOnChainEvent.build());
-        migratedEngine.eventHandler.on("mergeMessage", handleMergeMessage);
-      });
-      afterEach(() => {
-        migratedEngine.eventHandler.off("mergeMessage", handleMergeMessage);
-      });
-      test("fails if no l2 id registry event", async () => {
-        const result = await migratedEngine.mergeMessage(castAdd);
-        expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
-        expect(result._unsafeUnwrapErr().message).toMatch("unknown fid");
-      });
-      test("fails if no on chain signer", async () => {
-        const idRegistryOnChainEvent = Factories.IdRegistryOnChainEvent.build({ fid });
-        await migratedEngine.mergeOnChainEvent(idRegistryOnChainEvent);
-        const result = await migratedEngine.mergeMessage(castAdd);
-        expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
-        expect(result._unsafeUnwrapErr().message).toMatch("invalid signer");
-      });
-      test("succeeds with l2 id registry event and on chain signer", async () => {
-        const idRegistryOnChainEvent = Factories.IdRegistryOnChainEvent.build({ fid });
-        const signerEventBody = Factories.SignerEventBody.build({ key: signerAdd.data.signerAddBody.signer });
-        const onChainSignerEvent = Factories.SignerOnChainEvent.build({ fid, signerEventBody });
-        await migratedEngine.mergeOnChainEvent(idRegistryOnChainEvent);
-        await migratedEngine.mergeOnChainEvent(onChainSignerEvent);
-
-        await expect(migratedEngine.mergeMessage(castAdd)).resolves.toBeInstanceOf(Ok);
-        await expect(migratedEngine.getCast(fid, castAdd.hash)).resolves.toEqual(ok(castAdd));
-        expect(mergedMessages).toEqual([castAdd]);
-      });
-      test("fails if signer is removed on chain", async () => {
-        const idRegistryOnChainEvent = Factories.IdRegistryOnChainEvent.build({ fid });
-        const signerEventBody = Factories.SignerEventBody.build({ key: signerAdd.data.signerAddBody.signer });
-        const onChainSignerEvent = Factories.SignerOnChainEvent.build({ fid, signerEventBody });
-
-        const signerRemovalBody = Factories.SignerEventBody.build({
-          eventType: SignerEventType.REMOVE,
-          key: signerAdd.data.signerAddBody.signer,
-        });
-        const signerRemovalEvent = Factories.SignerOnChainEvent.build({
-          fid,
-          blockNumber: onChainSignerEvent.blockNumber + 1,
-          signerEventBody: signerRemovalBody,
-        });
-
-        await migratedEngine.mergeOnChainEvent(idRegistryOnChainEvent);
-        await migratedEngine.mergeOnChainEvent(onChainSignerEvent);
-        await migratedEngine.mergeOnChainEvent(signerRemovalEvent);
-
-        const result = await migratedEngine.mergeMessage(castAdd);
-        expect(result).toMatchObject(err({ errCode: "bad_request.validation_failure" }));
-        expect(result._unsafeUnwrapErr().message).toMatch("invalid signer");
-      });
-    });
-  });
 });
 
 describe("mergeMessages", () => {
@@ -810,25 +802,17 @@ describe("mergeMessages", () => {
 
   beforeEach(async () => {
     mergedMessages = [];
-    await engine.mergeIdRegistryEvent(custodyEvent);
-    await engine.mergeMessage(signerAdd);
+    await engine.mergeOnChainEvent(custodyEvent);
+    await engine.mergeOnChainEvent(signerAddEvent);
+    await engine.mergeOnChainEvent(storageEvent);
   });
 
   test("succeeds and merges messages in parallel", async () => {
-    const results = await engine.mergeMessages([
-      castAdd,
-      reactionAdd,
-      linkAdd,
-      userDataAdd,
-      verificationAdd,
-      signerRemove,
-    ]);
+    const results = await engine.mergeMessages([castAdd, reactionAdd, linkAdd, userDataAdd, verificationAdd]);
     for (const result of results) {
       expect(result).toBeInstanceOf(Ok);
     }
-    expect(new Set(mergedMessages)).toEqual(
-      new Set([signerAdd, castAdd, reactionAdd, linkAdd, userDataAdd, verificationAdd, signerRemove]),
-    );
+    expect(new Set(mergedMessages)).toEqual(new Set([castAdd, reactionAdd, linkAdd, userDataAdd, verificationAdd]));
   });
 });
 
@@ -848,8 +832,9 @@ describe("revokeMessagesBySigner", () => {
 
   beforeEach(async () => {
     revokedMessages = [];
-    await engine.mergeIdRegistryEvent(custodyEvent);
-    await engine.mergeMessage(signerAdd);
+    await engine.mergeOnChainEvent(custodyEvent);
+    await engine.mergeOnChainEvent(signerAddEvent);
+    await engine.mergeOnChainEvent(storageEvent);
     await engine.mergeMessage(castAdd);
     await engine.mergeMessage(reactionAdd);
     await engine.mergeMessage(linkAdd);
@@ -862,18 +847,6 @@ describe("revokeMessagesBySigner", () => {
     const tsHash = makeTsHash(data.timestamp, message.hash)._unsafeUnwrap();
     return getMessage(db, data.fid, typeToSetPostfix(data.type), tsHash);
   };
-
-  test("revokes messages signed by EIP-712 signer", async () => {
-    const signerMessages = [signerAdd];
-    for (const message of signerMessages) {
-      await expect(checkMessage(message)).resolves.toEqual(message);
-    }
-    await expect(engine.revokeMessagesBySigner(fid, custodySignerKey)).resolves.toBeInstanceOf(Ok);
-    for (const message of signerMessages) {
-      await expect(checkMessage(message)).rejects.toThrow();
-    }
-    expect(revokedMessages).toEqual(signerMessages);
-  });
 
   test("revokes messages signed by Ed25519 signer", async () => {
     const signerMessages = [castAdd, reactionAdd, linkAdd, verificationAdd, userDataAdd];
@@ -912,8 +885,9 @@ describe("with listeners and workers", () => {
 
   describe("with messages", () => {
     beforeEach(async () => {
-      await liveEngine.mergeIdRegistryEvent(custodyEvent);
-      await liveEngine.mergeMessage(signerAdd);
+      await liveEngine.mergeOnChainEvent(custodyEvent);
+      await liveEngine.mergeOnChainEvent(signerAddEvent);
+      await liveEngine.mergeOnChainEvent(storageEvent);
       await liveEngine.mergeMessages([castAdd, reactionAdd, linkAdd]);
       expect(await liveEngine.getCast(fid, castAdd.hash)).toEqual(ok(castAdd));
       expect(
@@ -929,75 +903,8 @@ describe("with listeners and workers", () => {
       ).toEqual(ok(linkAdd));
     });
 
-    test("revokes messages when SignerRemove is merged", async () => {
-      await liveEngine.mergeMessage(signerRemove);
-      expect(revokedMessages).toEqual([]);
-      await sleep(200); // Wait for engine to revoke messages
-      expect(revokedMessages).toEqual([castAdd, reactionAdd, linkAdd]);
-    });
-
-    test("revokes messages when fid is transferred", async () => {
-      const custodyTransfer = Factories.IdRegistryEvent.build({
-        fid,
-        from: custodyEvent.to,
-        blockNumber: custodyEvent.blockNumber + 1,
-      });
-      await liveEngine.mergeIdRegistryEvent(custodyTransfer);
-      await sleep(200);
-      // Does not immediately revoke messages, will wait 1 hr
-      expect(revokedMessages).toEqual([]);
-
-      // Manually trigger the job
-      const queue = new RevokeMessagesBySignerJobQueue(db);
-      const worker = new RevokeMessagesBySignerJobWorker(queue, db, liveEngine);
-      await worker.processJobs(Date.now() + 1000 * 10 * 60 + 5000);
-      expect(revokedMessages).toEqual([]); // No messages revoked yet, after 10 mins
-
-      // Revokes messages after 1 hr
-      await worker.processJobs(Date.now() + 1000 * 60 * 60 + 5000);
-      expect(revokedMessages).toContainEqual(signerAdd);
-      expect(revokedMessages).toContainEqual(castAdd);
-      expect(revokedMessages).toContainEqual(reactionAdd);
-      expect(revokedMessages).toContainEqual(linkAdd);
-    });
-
-    test("revokes messages when SignerAdd is pruned", async () => {
-      const event = HubEvent.create({
-        type: HubEventType.PRUNE_MESSAGE,
-        pruneMessageBody: { message: signerAdd },
-      });
-      liveEngine.eventHandler.emit("pruneMessage", event as PruneMessageHubEvent); // Hack to force prune
-      expect(revokedMessages).toEqual([]);
-      await sleep(200); // Wait for engine to revoke messages
-      expect(revokedMessages).toEqual([castAdd, reactionAdd, linkAdd]);
-    });
-
-    test("revokes messages when SignerAdd is revoked", async () => {
-      const event = HubEvent.create({
-        type: HubEventType.REVOKE_MESSAGE,
-        revokeMessageBody: { message: signerAdd },
-      });
-      liveEngine.eventHandler.emit("revokeMessage", event as RevokeMessageHubEvent); // Hack to force revoke
-      expect(revokedMessages).toEqual([signerAdd]);
-      await sleep(200); // Wait for engine to revoke messages
-      expect(revokedMessages).toEqual([signerAdd, castAdd, reactionAdd, linkAdd]);
-    });
-
     test("revokes messages when onchain signer is removed", async () => {
-      const idRegistryOnChainEvent = Factories.IdRegistryOnChainEvent.build({ fid });
-      const signerEventBody = Factories.SignerEventBody.build({ key: signerAdd.data.signerAddBody.signer });
-      const onChainSignerEvent = Factories.SignerOnChainEvent.build({ fid, signerEventBody });
-
-      await liveEngine.mergeOnChainEvent(idRegistryOnChainEvent);
-      await liveEngine.mergeOnChainEvent(onChainSignerEvent);
-      await liveEngine.mergeOnChainEvent(Factories.SignerMigratedOnChainEvent.build());
-
-      const signerRemovalBody = Factories.SignerEventBody.build({
-        eventType: SignerEventType.REMOVE,
-        key: signerEventBody.key,
-      });
-      const signerRemovalEvent = Factories.SignerOnChainEvent.build({ fid, signerEventBody: signerRemovalBody });
-      await liveEngine.mergeOnChainEvent(signerRemovalEvent);
+      await expect(liveEngine.mergeOnChainEvent(signerRemoveEvent)).resolves.toBeInstanceOf(Ok);
 
       expect(revokedMessages).toEqual([]);
       await sleep(200); // Wait for engine to revoke messages
@@ -1009,12 +916,12 @@ describe("with listeners and workers", () => {
       const nameProof = Factories.UserNameProof.build({
         name: fname,
         fid,
-        owner: custodyEvent.to,
+        owner: custodyEvent.idRegisterEventBody.to,
       });
       const anotherNameProof = Factories.UserNameProof.build({
         name: Factories.Fname.build(),
         fid,
-        owner: custodyEvent.to,
+        owner: custodyEvent.idRegisterEventBody.to,
       });
       await expect(liveEngine.mergeUserNameProof(nameProof)).resolves.toBeInstanceOf(Ok);
       await expect(liveEngine.mergeUserNameProof(anotherNameProof)).resolves.toBeInstanceOf(Ok);
@@ -1069,7 +976,7 @@ describe("with listeners and workers", () => {
 
 describe("stop", () => {
   test("removes all event listeners", async () => {
-    const eventNames: (keyof StoreEvents)[] = ["mergeMessage", "mergeIdRegistryEvent", "pruneMessage", "revokeMessage"];
+    const eventNames: (keyof StoreEvents)[] = ["mergeOnChainEvent", "mergeUsernameProofEvent"];
     const scopedEngine = new Engine(db, FarcasterNetwork.TESTNET);
     for (const eventName of eventNames) {
       expect(scopedEngine.eventHandler.listenerCount(eventName)).toEqual(0);

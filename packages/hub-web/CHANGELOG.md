@@ -1,5 +1,94 @@
 # @farcaster/hub-web
 
+## 0.6.9
+
+### Patch Changes
+
+- 06bb2f43: chore: Go lang example for submitMessage()
+- a5708f85: chore: Remove grpc-web
+- ba86d374: feat: Allow signing raw message data bytes to support rust, Golang etc...
+- Updated dependencies [ba86d374]
+  - @farcaster/core@0.12.14
+
+## 0.6.8
+
+### Patch Changes
+
+- f4e50b95: fix: use interface for Viem PublicClient, add optional publicClients to builders
+- Updated dependencies [f4e50b95]
+  - @farcaster/core@0.12.13
+
+## 0.6.7
+
+### Patch Changes
+
+- 81e6d8ec: FIP-8 contract verifications
+- aacff028: Remove eslint-config-custom dependencies
+- c33f5270: fix: Run protoc as user instead of root
+- 433bee81: feat: Enable events sync by default
+- Updated dependencies [81e6d8ec]
+- Updated dependencies [aacff028]
+- Updated dependencies [c33f5270]
+- Updated dependencies [433bee81]
+  - @farcaster/core@0.12.12
+
+## 0.6.6
+
+### Patch Changes
+
+- b7c2b0a9: chore: Replace hub-web with HTTP api examples
+- 14f67cf2: feat: Add peer scoring
+- Updated dependencies [ef795c71]
+- Updated dependencies [14f67cf2]
+  - @farcaster/core@0.12.11
+
+## 0.6.5
+
+### Patch Changes
+
+- d77970b1: chore: Delete deprecated rpc calls and events
+- Updated dependencies [7e2a66e5]
+- Updated dependencies [20062ceb]
+- Updated dependencies [d77970b1]
+  - @farcaster/core@0.12.9
+
+## 0.6.4
+
+### Patch Changes
+
+- 08b652e: fix: Add txIndex to onchain events, fix wrong index being used in the primary key
+- Updated dependencies [08b652e]
+  - @farcaster/core@0.12.7
+
+## 0.6.3
+
+### Patch Changes
+
+- 76a031e2: feat: Add storage limit constants to core
+- Updated dependencies [bc416dbe]
+- Updated dependencies [76a031e2]
+  - @farcaster/core@0.12.6
+
+## 0.6.2
+
+### Patch Changes
+
+- bf1c44d2: feat: Update signer onchain event to store new fields and add additional RPC calls
+- Updated dependencies [e6180074]
+- Updated dependencies [bf1c44d2]
+  - @farcaster/core@0.12.5
+
+## 0.6.1
+
+### Patch Changes
+
+- 1fcfd495: fix: fetching l2 events was not respecting --l2-first-block
+- c6d79cdb: feat: on chain event ordering updated to be more consistent
+- Updated dependencies [e55e571f]
+- Updated dependencies [1fcfd495]
+- Updated dependencies [c6d79cdb]
+  - @farcaster/core@0.12.4
+
 ## 0.6.0
 
 ### Minor Changes

@@ -8,6 +8,9 @@ import { fromFarcasterTime, getFarcasterTime } from "./time";
 import * as validations from "./validations";
 import { makeVerificationEthAddressClaim } from "./verifications";
 import { UserDataType, UserNameType } from "@farcaster/hub-nodejs";
+import { defaultL1PublicClient } from "./eth/clients";
+import { optimism } from "viem/chains";
+import { jest } from "@jest/globals";
 
 const signer = Factories.Ed25519Signer.build();
 const ethSigner = Factories.Eip712Signer.build();
@@ -15,6 +18,10 @@ let ethSignerKey: Uint8Array;
 
 beforeAll(async () => {
   ethSignerKey = (await ethSigner.getSignerKey())._unsafeUnwrap();
+});
+
+afterEach(async () => {
+  jest.restoreAllMocks();
 });
 
 describe("validateFid", () => {
@@ -646,7 +653,7 @@ describe("validateVerificationAddEthAddressSignature", () => {
   const fid = Factories.Fid.build();
   const network = Factories.FarcasterNetwork.build();
 
-  test("succeeds", async () => {
+  test("succeeds for eoas", async () => {
     const body = await Factories.VerificationAddEthAddressBody.create({}, { transient: { fid, network } });
     const result = await validations.validateVerificationAddEthAddressSignature(body, fid, network);
     expect(result.isOk()).toBeTruthy();
@@ -660,6 +667,81 @@ describe("validateVerificationAddEthAddressSignature", () => {
     expect(result).toEqual(err(new HubError("unknown", "Cannot convert 0x to a BigInt")));
   });
 
+  test("fails with invalid verificationType", async () => {
+    const body = await Factories.VerificationAddEthAddressBody.create({
+      ethSignature: Factories.Bytes.build({}, { transient: { length: 1 } }),
+      verificationType: 2,
+    });
+    const result = await validations.validateVerificationAddEthAddressSignature(body, fid, network);
+    expect(result).toEqual(err(new HubError("bad_request.invalid_param", "Invalid verification type")));
+  });
+
+  test("fails with invalid chainId", async () => {
+    const body = await Factories.VerificationAddEthAddressBody.create({
+      ethSignature: Factories.Bytes.build({}, { transient: { length: 1 } }),
+      chainId: 7,
+      verificationType: 1,
+    });
+    const result = await validations.validateVerificationAddEthAddressSignature(body, fid, network);
+    expect(result).toEqual(err(new HubError("bad_request.invalid_param", "Invalid chain ID")));
+  });
+
+  test("fails if client not provided for chainId", async () => {
+    const body = await Factories.VerificationAddEthAddressBody.create({
+      ethSignature: Factories.Bytes.build({}, { transient: { length: 1 } }),
+      chainId: 1,
+      verificationType: 1,
+    });
+    const result = await validations.validateVerificationAddEthAddressSignature(body, fid, network, {});
+    expect(result).toEqual(err(new HubError("bad_request.invalid_param", "RPC client not provided for chainId 1")));
+  });
+
+  test("fails if ethSignature is > 256 bytes", async () => {
+    const body = await Factories.VerificationAddEthAddressBody.create({
+      ethSignature: Factories.Bytes.build({}, { transient: { length: 257 } }),
+    });
+    const result = await validations.validateVerificationAddEthAddressSignature(body, fid, network, {});
+    expect(result).toEqual(err(new HubError("bad_request.validation_failure", "ethSignature > 256 bytes")));
+  });
+
+  test("succeeds for contract signatures", async () => {
+    jest.spyOn(defaultL1PublicClient, "verifyTypedData").mockImplementation(() => {
+      return Promise.resolve(true);
+    });
+    const chainId = 1;
+    const publicClients = {
+      [chainId]: defaultL1PublicClient,
+    };
+    const body = await Factories.VerificationAddEthAddressBody.create(
+      {
+        chainId,
+        verificationType: 1,
+      },
+      { transient: { fid, network, contractSignature: true } },
+    );
+    const result = await validations.validateVerificationAddEthAddressSignature(body, fid, network, publicClients);
+    expect(result.isOk()).toBeTruthy();
+  });
+
+  test("fails with invalid contract signature", async () => {
+    jest.spyOn(defaultL1PublicClient, "verifyTypedData").mockImplementation(() => {
+      return Promise.resolve(false);
+    });
+    const chainId = 1;
+    const publicClients = {
+      [chainId]: defaultL1PublicClient,
+    };
+    const body = await Factories.VerificationAddEthAddressBody.create(
+      {
+        chainId,
+        verificationType: 1,
+      },
+      { transient: { fid, network, contractSignature: true } },
+    );
+    const result = await validations.validateVerificationAddEthAddressSignature(body, fid, network, publicClients);
+    expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid ethSignature")));
+  });
+
   test("fails with eth signature from different address", async () => {
     const blockHash = Factories.BlockHash.build();
     const claim = makeVerificationEthAddressClaim(fid, ethSignerKey, network, blockHash)._unsafeUnwrap();
@@ -671,7 +753,7 @@ describe("validateVerificationAddEthAddressSignature", () => {
       address: Factories.EthAddress.build(),
     });
     const result = await validations.validateVerificationAddEthAddressSignature(body, fid, network);
-    expect(result).toEqual(err(new HubError("bad_request.validation_failure", "ethSignature does not match address")));
+    expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid ethSignature")));
   });
 });
 
@@ -703,88 +785,6 @@ describe("validateVerificationRemoveBody", () => {
         address: Factories.Bytes.build({}, { transient: { length: 21 } }),
       });
       hubErrorMessage = "address must be 20 bytes";
-    });
-  });
-});
-
-describe("validateSignerAddBody", () => {
-  test("succeeds", async () => {
-    const body = Factories.SignerAddBody.build();
-    expect(validations.validateSignerAddBody(body)).toEqual(ok(body));
-  });
-
-  describe("fails", () => {
-    let body: protobufs.SignerAddBody;
-    let hubErrorMessage: string;
-
-    afterEach(() => {
-      expect(validations.validateSignerAddBody(body)).toEqual(
-        err(new HubError("bad_request.validation_failure", hubErrorMessage)),
-      );
-    });
-
-    test("when signer is missing", () => {
-      body = Factories.SignerAddBody.build({
-        signer: undefined,
-      });
-      hubErrorMessage = "publicKey is missing";
-    });
-
-    test("with invalid signer", () => {
-      body = Factories.SignerAddBody.build({
-        signer: Factories.Bytes.build({}, { transient: { length: 33 } }),
-      });
-      hubErrorMessage = "publicKey must be 32 bytes";
-    });
-
-    test("with name as empty string", () => {
-      body = Factories.SignerAddBody.build({ name: "" });
-      hubErrorMessage = "name cannot be empty string";
-    });
-
-    test("with name > 32 chars", () => {
-      body = Factories.SignerAddBody.build({ name: faker.random.alphaNumeric(33) });
-      hubErrorMessage = "name > 32 bytes";
-    });
-
-    test("with name > 32 bytes", () => {
-      let name = "";
-      for (let i = 0; i < 10; i++) {
-        name = `${name}🔥`;
-      }
-      body = Factories.SignerAddBody.build({ name });
-    });
-  });
-});
-
-describe("validateSignerRemoveBody", () => {
-  test("succeeds", async () => {
-    const body = Factories.SignerRemoveBody.build();
-    expect(validations.validateSignerRemoveBody(body)).toEqual(ok(body));
-  });
-
-  describe("fails", () => {
-    let body: protobufs.SignerRemoveBody;
-    let hubErrorMessage: string;
-
-    afterEach(() => {
-      expect(validations.validateSignerRemoveBody(body)).toEqual(
-        err(new HubError("bad_request.validation_failure", hubErrorMessage)),
-      );
-    });
-
-    test("when signer is missing", () => {
-      body = Factories.SignerRemoveBody.build({
-        signer: undefined,
-      });
-      hubErrorMessage = "publicKey is missing";
-    });
-
-    test("with invalid signer", () => {
-      body = Factories.SignerRemoveBody.build({
-        signer: Factories.Bytes.build({}, { transient: { length: 33 } }),
-      });
-      hubErrorMessage = "publicKey must be 32 bytes";
     });
   });
 });
@@ -897,12 +897,10 @@ describe("validateMessage", () => {
     expect(result._unsafeUnwrap()).toEqual(message);
   });
 
-  test("succeeds with EIP712 signer", async () => {
-    const message = await Factories.Message.create(
-      { data: Factories.SignerAddData.build() },
-      { transient: { signer: ethSigner } },
-    );
-
+  test("succeeds with data_bytes and Ed25519 signer", async () => {
+    const message = await Factories.Message.create({}, { transient: { signer } });
+    // biome-ignore lint/style/noNonNullAssertion: <explanation>
+    message.dataBytes = protobufs.MessageData.encode(message.data!).finish();
     const result = await validations.validateMessage(message);
     expect(result._unsafeUnwrap()).toEqual(message);
   });
@@ -910,16 +908,6 @@ describe("validateMessage", () => {
   test("fails with EIP712 signer and non-signer message type", async () => {
     // Default message type is CastAdd
     const message = await Factories.Message.create({}, { transient: { signer: ethSigner } });
-    const result = await validations.validateMessage(message);
-    expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid signatureScheme")));
-  });
-
-  test("fails with Ed25519 signer and signer message type", async () => {
-    const message = await Factories.Message.create(
-      { data: Factories.SignerAddData.build() },
-      { transient: { signer } },
-    );
-
     const result = await validations.validateMessage(message);
     expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid signatureScheme")));
   });
@@ -937,6 +925,17 @@ describe("validateMessage", () => {
     const message = await Factories.Message.create({
       hash: Factories.Bytes.build({}, { transient: { length: 1 } }),
     });
+
+    const result = await validations.validateMessage(message);
+    expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid hash")));
+  });
+
+  test("fails with invalid hash and data_bytes", async () => {
+    const message = await Factories.Message.create({
+      hash: Factories.Bytes.build({}, { transient: { length: 1 } }),
+    });
+    // biome-ignore lint/style/noNonNullAssertion: <explanation>
+    message.dataBytes = protobufs.MessageData.encode(message.data!).finish();
 
     const result = await validations.validateMessage(message);
     expect(result).toEqual(err(new HubError("bad_request.validation_failure", "invalid hash")));

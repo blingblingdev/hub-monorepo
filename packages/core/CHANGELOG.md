@@ -1,5 +1,84 @@
 # @farcaster/core
 
+## 0.12.14
+
+### Patch Changes
+
+- ba86d374: feat: Allow signing raw message data bytes to support rust, Golang etc...
+
+## 0.12.13
+
+### Patch Changes
+
+- f4e50b95: fix: use interface for Viem PublicClient, add optional publicClients to builders
+
+## 0.12.12
+
+### Patch Changes
+
+- 81e6d8ec: FIP-8 contract verifications
+- aacff028: Remove eslint-config-custom dependencies
+- c33f5270: fix: Run protoc as user instead of root
+- 433bee81: feat: Enable events sync by default
+
+## 0.12.11
+
+### Patch Changes
+
+- ef795c71: upgrade viem to 1.12.2
+- 14f67cf2: feat: Add peer scoring
+
+## 0.12.10
+
+### Patch Changes
+
+- 31641c17: fix: Bound generated timestamps for tests
+- fb1f5c61: feat: Support onchain events and fnames in sync trie
+- aeab5a4c: docs: Refactor HTTP API docs
+- 4b99eddb: feat: Support fname and onchain event syncids
+
+## 0.12.9
+
+### Patch Changes
+
+- 7e2a66e5: feat: Add a function to parse the timestamp from the eventId
+- 20062ceb: chore: cleanup default links store size code
+- d77970b1: chore: Delete deprecated rpc calls and events
+
+## 0.12.8
+
+### Patch Changes
+
+- 4893e02d: fix: Update links store size to be 2500 in the future
+
+## 0.12.7
+
+### Patch Changes
+
+- 08b652e: fix: Add txIndex to onchain events, fix wrong index being used in the primary key
+
+## 0.12.6
+
+### Patch Changes
+
+- bc416dbe: feat: Allow Hub operators to set an FID
+- 76a031e2: feat: Add storage limit constants to core
+
+## 0.12.5
+
+### Patch Changes
+
+- e6180074: feat: enforce storage pruning 1 day after migration
+- bf1c44d2: feat: Update signer onchain event to store new fields and add additional RPC calls
+
+## 0.12.4
+
+### Patch Changes
+
+- e55e571f: feat: Add "getting blockchain events" to hub status
+- 1fcfd495: fix: fetching l2 events was not respecting --l2-first-block
+- c6d79cdb: feat: on chain event ordering updated to be more consistent
+
 ## 0.12.3
 
 ### Patch Changes

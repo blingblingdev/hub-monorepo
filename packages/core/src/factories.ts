@@ -21,7 +21,7 @@ import {
 } from "./protobufs";
 import { bytesToHexString, utf8StringToBytes } from "./bytes";
 import { Ed25519Signer, Eip712Signer, NobleEd25519Signer, Signer, ViemLocalEip712Signer } from "./signers";
-import { getFarcasterTime, toFarcasterTime } from "./time";
+import { FARCASTER_EPOCH, getFarcasterTime, toFarcasterTime } from "./time";
 import { VerificationEthAddressClaim } from "./verifications";
 import { LocalAccount } from "viem";
 
@@ -156,8 +156,6 @@ const MessageTypeFactory = Factory.define<protobufs.MessageType>(() => {
     protobufs.MessageType.CAST_REMOVE,
     protobufs.MessageType.REACTION_ADD,
     protobufs.MessageType.REACTION_REMOVE,
-    protobufs.MessageType.SIGNER_ADD,
-    protobufs.MessageType.SIGNER_REMOVE,
     protobufs.MessageType.USER_DATA_ADD,
     protobufs.MessageType.VERIFICATION_ADD_ETH_ADDRESS,
     protobufs.MessageType.VERIFICATION_REMOVE,
@@ -178,11 +176,7 @@ const MessageFactory = Factory.define<protobufs.Message, { signer?: Ed25519Signe
       }
 
       // Set signer
-      const isEip712Signer =
-        message.data.type === protobufs.MessageType.SIGNER_ADD ||
-        message.data.type === protobufs.MessageType.SIGNER_REMOVE;
-      const signer: Signer =
-        transientParams.signer ?? (isEip712Signer ? Eip712SignerFactory.build() : Ed25519SignerFactory.build());
+      const signer: Signer = transientParams.signer ?? Ed25519SignerFactory.build();
 
       // Generate signature
       if (message.signature.length === 0) {
@@ -378,59 +372,6 @@ const ReactionRemoveMessageFactory = Factory.define<protobufs.ReactionRemoveMess
   },
 );
 
-const SignerAddBodyFactory = Factory.define<protobufs.SignerAddBody>(() => {
-  return protobufs.SignerAddBody.create({
-    name: faker.random.alphaNumeric(16),
-    signer: Ed25519PPublicKeyFactory.build(),
-  });
-});
-
-const SignerAddDataFactory = Factory.define<protobufs.SignerAddData>(() => {
-  return MessageDataFactory.build({
-    signerAddBody: SignerAddBodyFactory.build(),
-    type: protobufs.MessageType.SIGNER_ADD,
-  }) as protobufs.SignerAddData;
-});
-
-const SignerAddMessageFactory = Factory.define<protobufs.SignerAddMessage, { signer?: Eip712Signer }>(
-  ({ onCreate, transientParams }) => {
-    onCreate((message) => {
-      return MessageFactory.create(message, { transient: transientParams }) as Promise<protobufs.SignerAddMessage>;
-    });
-
-    return MessageFactory.build(
-      { data: SignerAddDataFactory.build(), signatureScheme: protobufs.SignatureScheme.EIP712 },
-      { transient: transientParams },
-    ) as protobufs.SignerAddMessage;
-  },
-);
-
-const SignerRemoveBodyFactory = Factory.define<protobufs.SignerRemoveBody>(() => {
-  return protobufs.SignerRemoveBody.create({
-    signer: Ed25519PPublicKeyFactory.build(),
-  });
-});
-
-const SignerRemoveDataFactory = Factory.define<protobufs.SignerRemoveData>(() => {
-  return MessageDataFactory.build({
-    signerRemoveBody: SignerRemoveBodyFactory.build(),
-    type: protobufs.MessageType.SIGNER_REMOVE,
-  }) as protobufs.SignerRemoveData;
-});
-
-const SignerRemoveMessageFactory = Factory.define<protobufs.SignerRemoveMessage, { signer?: Eip712Signer }>(
-  ({ onCreate, transientParams }) => {
-    onCreate((message) => {
-      return MessageFactory.create(message, { transient: transientParams }) as Promise<protobufs.SignerRemoveMessage>;
-    });
-
-    return MessageFactory.build(
-      { data: SignerRemoveDataFactory.build(), signatureScheme: protobufs.SignatureScheme.EIP712 },
-      { transient: transientParams },
-    ) as protobufs.SignerRemoveMessage;
-  },
-);
-
 const VerificationEthAddressClaimFactory = Factory.define<VerificationEthAddressClaim>(() => {
   const address = bytesToHexString(EthAddressFactory.build())._unsafeUnwrap();
   const blockHash = bytesToHexString(BlockHashFactory.build())._unsafeUnwrap();
@@ -445,12 +386,19 @@ const VerificationEthAddressClaimFactory = Factory.define<VerificationEthAddress
 
 const VerificationAddEthAddressBodyFactory = Factory.define<
   protobufs.VerificationAddEthAddressBody,
-  { fid?: number; network?: protobufs.FarcasterNetwork; signer?: Eip712Signer | undefined },
+  {
+    fid?: number;
+    network?: protobufs.FarcasterNetwork;
+    signer?: Eip712Signer | undefined;
+    contractSignature?: boolean;
+  },
   protobufs.VerificationAddEthAddressBody
 >(({ onCreate, transientParams }) => {
   onCreate(async (body) => {
     const ethSigner = transientParams.signer ?? Eip712SignerFactory.build();
-    body.address = (await ethSigner.getSignerKey())._unsafeUnwrap();
+    if (!transientParams.contractSignature) {
+      body.address = (await ethSigner.getSignerKey())._unsafeUnwrap();
+    }
 
     if (body.ethSignature.length === 0) {
       // Generate address and signature
@@ -463,7 +411,7 @@ const VerificationAddEthAddressBodyFactory = Factory.define<
         blockHash: blockHash.isOk() ? blockHash.value : "0x",
         address: bytesToHexString(body.address)._unsafeUnwrap(),
       });
-      body.ethSignature = (await ethSigner.signVerificationEthAddressClaim(claim))._unsafeUnwrap();
+      body.ethSignature = (await ethSigner.signVerificationEthAddressClaim(claim, body.chainId))._unsafeUnwrap();
     }
 
     return body;
@@ -592,43 +540,6 @@ const UsernameProofMessageFactory = Factory.define<protobufs.UsernameProofMessag
   },
 );
 
-/** Contract event Protobufs */
-
-const IdRegistryEventTypeFactory = Factory.define<protobufs.IdRegistryEventType>(() => {
-  return faker.helpers.arrayElement([protobufs.IdRegistryEventType.REGISTER, protobufs.IdRegistryEventType.TRANSFER]);
-});
-
-const IdRegistryEventFactory = Factory.define<protobufs.IdRegistryEvent>(() => {
-  return protobufs.IdRegistryEvent.create({
-    blockNumber: faker.datatype.number({ min: 1, max: 100_000 }),
-    blockHash: BlockHashFactory.build(),
-    transactionHash: TransactionHashFactory.build(),
-    logIndex: faker.datatype.number({ min: 0, max: 1_000 }),
-    fid: FidFactory.build(),
-    to: EthAddressFactory.build(),
-    type: IdRegistryEventTypeFactory.build(),
-    from: EthAddressFactory.build(),
-  });
-});
-
-const NameRegistryEventTypeFactory = Factory.define<protobufs.NameRegistryEventType>(() => {
-  return faker.helpers.arrayElement([protobufs.NameRegistryEventType.RENEW, protobufs.NameRegistryEventType.TRANSFER]);
-});
-
-const NameRegistryEventFactory = Factory.define<protobufs.NameRegistryEvent>(() => {
-  return protobufs.NameRegistryEvent.create({
-    blockNumber: faker.datatype.number({ min: 1, max: 100_000 }),
-    blockHash: BlockHashFactory.build(),
-    transactionHash: TransactionHashFactory.build(),
-    logIndex: faker.datatype.number({ min: 0, max: 1_000 }),
-    fname: FnameFactory.build(),
-    to: EthAddressFactory.build(),
-    type: NameRegistryEventTypeFactory.build(),
-    from: EthAddressFactory.build(),
-    expiry: getFarcasterTime()._unsafeUnwrap() + 60 * 60 * 24 * 365, // a year
-  });
-});
-
 const OnChainEventFactory = Factory.define<protobufs.OnChainEvent>(() => {
   return protobufs.OnChainEvent.create({
     type: OnChainEventType.EVENT_TYPE_SIGNER,
@@ -636,7 +547,7 @@ const OnChainEventFactory = Factory.define<protobufs.OnChainEvent>(() => {
     fid: FidFactory.build(),
     blockNumber: faker.datatype.number({ min: 1, max: 100_000 }),
     blockHash: BlockHashFactory.build(),
-    blockTimestamp: faker.datatype.datetime().getTime(),
+    blockTimestamp: Math.floor(faker.datatype.datetime({ min: FARCASTER_EPOCH, max: Date.now() }).getTime() / 1000),
     transactionHash: TransactionHashFactory.build(),
     logIndex: faker.datatype.number({ min: 0, max: 1_000 }),
   });
@@ -657,14 +568,17 @@ const SignerEventBodyFactory = Factory.define<protobufs.SignerEventBody>(() => {
   return SignerEventBody.create({
     key: Ed25519PPublicKeyFactory.build(),
     eventType: SignerEventType.ADD,
-    scheme: 1,
+    keyType: 1,
+    metadataType: 1,
   });
 });
 
-const SignerOnChainEventFactory = Factory.define<SignerOnChainEvent>(() => {
+const SignerOnChainEventFactory = Factory.define<SignerOnChainEvent, { signer?: Uint8Array }>(({ transientParams }) => {
   return OnChainEventFactory.build({
     type: OnChainEventType.EVENT_TYPE_SIGNER,
-    signerEventBody: SignerEventBodyFactory.build(),
+    signerEventBody: transientParams.signer
+      ? SignerEventBodyFactory.build({ key: transientParams.signer })
+      : SignerEventBodyFactory.build(),
   }) as protobufs.SignerOnChainEvent;
 });
 
@@ -675,19 +589,23 @@ const IdRegisterEventBodyFactory = Factory.define<protobufs.IdRegisterEventBody>
   });
 });
 
-const IdRegisterOnChainEventFactory = Factory.define<IdRegisterOnChainEvent>(() => {
-  return OnChainEventFactory.build({
-    type: OnChainEventType.EVENT_TYPE_ID_REGISTER,
-    idRegisterEventBody: IdRegisterEventBodyFactory.build(),
-  }) as protobufs.IdRegisterOnChainEvent;
-});
+const IdRegisterOnChainEventFactory = Factory.define<IdRegisterOnChainEvent, { to?: Uint8Array }>(
+  ({ transientParams }) => {
+    return OnChainEventFactory.build({
+      type: OnChainEventType.EVENT_TYPE_ID_REGISTER,
+      idRegisterEventBody: transientParams.to
+        ? IdRegisterEventBodyFactory.build({ to: transientParams.to })
+        : IdRegisterEventBodyFactory.build(),
+    }) as protobufs.IdRegisterOnChainEvent;
+  },
+);
 
 const SignerMigratedOnChainEventFactory = Factory.define<SignerMigratedOnChainEvent>(() => {
   return OnChainEventFactory.build({
     type: OnChainEventType.EVENT_TYPE_SIGNER_MIGRATED,
     fid: 0,
     signerMigratedEventBody: SignerMigratedEventBody.create({
-      migratedAt: Math.floor(faker.datatype.datetime().getTime() / 1000),
+      migratedAt: Math.floor(Date.now() / 1000) + 48 * 60 * 60, // Default to 48 hours in the future so pruning is not enabled
     }),
   }) as protobufs.SignerMigratedOnChainEvent;
 });
@@ -700,12 +618,16 @@ const StorageRentEventBodyFactory = Factory.define<protobufs.StorageRentEventBod
   });
 });
 
-const StorageRentOnChainEventFactory = Factory.define<StorageRentOnChainEvent>(() => {
-  return OnChainEventFactory.build({
-    type: OnChainEventType.EVENT_TYPE_STORAGE_RENT,
-    storageRentEventBody: StorageRentEventBodyFactory.build(),
-  }) as protobufs.StorageRentOnChainEvent;
-});
+const StorageRentOnChainEventFactory = Factory.define<StorageRentOnChainEvent, { units?: number }>(
+  ({ transientParams }) => {
+    return OnChainEventFactory.build({
+      type: OnChainEventType.EVENT_TYPE_STORAGE_RENT,
+      storageRentEventBody: transientParams.units
+        ? StorageRentEventBodyFactory.build({ units: transientParams.units })
+        : StorageRentEventBodyFactory.build(),
+    }) as protobufs.StorageRentOnChainEvent;
+  },
+);
 
 export const Factories = {
   Fid: FidFactory,
@@ -747,12 +669,6 @@ export const Factories = {
   ReactionAddMessage: ReactionAddMessageFactory,
   ReactionRemoveData: ReactionRemoveDataFactory,
   ReactionRemoveMessage: ReactionRemoveMessageFactory,
-  SignerAddBody: SignerAddBodyFactory,
-  SignerRemoveBody: SignerRemoveBodyFactory,
-  SignerAddData: SignerAddDataFactory,
-  SignerAddMessage: SignerAddMessageFactory,
-  SignerRemoveData: SignerRemoveDataFactory,
-  SignerRemoveMessage: SignerRemoveMessageFactory,
   VerificationEthAddressClaim: VerificationEthAddressClaimFactory,
   VerificationAddEthAddressBody: VerificationAddEthAddressBodyFactory,
   VerificationAddEthAddressData: VerificationAddEthAddressDataFactory,
@@ -763,10 +679,6 @@ export const Factories = {
   UserDataBody: UserDataBodyFactory,
   UserDataAddData: UserDataAddDataFactory,
   UserDataAddMessage: UserDataAddMessageFactory,
-  IdRegistryEventType: IdRegistryEventTypeFactory,
-  IdRegistryEvent: IdRegistryEventFactory,
-  NameRegistryEventType: NameRegistryEventTypeFactory,
-  NameRegistryEvent: NameRegistryEventFactory,
   UserNameProof: UserNameProofFactory,
   UsernameProofData: UsernameProofDataFactory,
   UsernameProofMessage: UsernameProofMessageFactory,

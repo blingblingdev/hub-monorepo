@@ -23,6 +23,7 @@ message OnChainEvent {
     IdRegisterEventBody id_register_event_body = 11;
     StorageRentEventBody storage_rent_event_body = 12;
   }
+  uint32 tx_index = 13;
 }
 
 enum SignerEventType {
@@ -34,9 +35,10 @@ enum SignerEventType {
 
 message SignerEventBody {
   bytes key = 1;
-  uint32 scheme = 2;
+  uint32 key_type = 2;
   SignerEventType event_type = 3;
   bytes metadata = 4;
+  uint32 metadata_type = 5;
 }
 
 message SignerMigratedEventBody {

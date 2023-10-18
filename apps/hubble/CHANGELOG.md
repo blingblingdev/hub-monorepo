@@ -1,5 +1,206 @@
 # @farcaster/hubble
 
+## 1.6.4
+
+### Patch Changes
+
+- a3e12f54: fix: Fix contactInfo messages not being forwarded and increase seen ttl to prevent future loops
+
+## 1.6.3
+
+### Patch Changes
+
+- 89ce7d2d: fix: enable asyncValidation so we don't forward invalid messages on gossip
+- a5708f85: chore: Remove grpc-web
+- b518b97f: fix: Cache numFids and numFnames
+- 86bed6f5: fix: Make message counts on-demand to speed startup
+- ba86d374: feat: Allow signing raw message data bytes to support rust, Golang etc...
+- Updated dependencies [ba86d374]
+  - @farcaster/hub-nodejs@0.10.14
+
+## 1.6.2
+
+### Patch Changes
+
+- 17ca659b: fix: Persist grafana container data
+- e2ada603: fix: Exists check should not crash the hub
+
+## 1.6.1
+
+### Patch Changes
+
+- 902447f8: fix: Fix buggy crontab entry that would try to upgrade every minute
+- e10a8c93: fix: Improve logging on unhandled errors
+- 81e6d8ec: FIP-8 contract verifications
+- aacff028: Remove eslint-config-custom dependencies
+- c7b28b06: fix: Run crontab as root for hubble.sh
+- 9ca079e4: chore: Add peer scores to grafana dashboard
+- 433bee81: feat: Enable events sync by default
+- f5c70348: docs: Linter now checks the rpc.proto to make sure all methods and implemented in HTTP API
+- c0741888: fix: Fix off by one error when inserting into trie
+- 5b7d5686: fix: Handle errors from L2 getevents
+- Updated dependencies [81e6d8ec]
+- Updated dependencies [aacff028]
+- Updated dependencies [c33f5270]
+- Updated dependencies [433bee81]
+  - @farcaster/hub-nodejs@0.10.12
+
+## 1.6.0
+
+### Minor Changes
+
+- 09b7949c: feat: make verifications globally unique
+
+### Patch Changes
+
+- 8abf1864: feat: add migration to clear onchain events and force re-sync
+- c64400dc: fix: Use DB_SCHEMA version in snapshot path
+- 4dea7e28: chore: Upgrade ed25519-dalek in rust
+- 472e8ae3: feat: Add a flag to clear l2 events
+- ef795c71: upgrade viem to 1.12.2
+- ef795c71: fall back to eth_getLogs in event sync
+- b7c2b0a9: chore: Replace hub-web with HTTP api examples
+- 14f67cf2: feat: Add peer scoring
+- 03cd3333: feat: Audit peer's messages during sync
+- Updated dependencies [14f67cf2]
+  - @farcaster/hub-nodejs@0.10.11
+
+## 1.5.6
+
+### Patch Changes
+
+- aa6553b1: feat: Enable HTTP API server
+- fb1f5c61: feat: Support onchain events and fnames in sync trie
+- f743a430: feat: Allow settings CORS for http api
+- f0ad204e: feat: Repair sync trie when events and fnames are already present
+- 833d9651: fix: hubble.sh - Don't delete before overwriting
+- bc4a1366: fix: HTTP API add getInfo and other doc fixes
+- aeab5a4c: docs: Refactor HTTP API docs
+- 4809c9c8: fix: HTTP API port in docker-compose
+- f163fa3d: chore: Remove "yarn status" command
+- 4b99eddb: feat: Support fname and onchain event syncids
+- Updated dependencies [aeab5a4c]
+  - @farcaster/hub-nodejs@0.10.10
+
+## 1.5.5
+
+### Patch Changes
+
+- a232963c: fix: Cleanup old snapshots from S3
+- 7cbd77ee: test: Add e2e test for hubble startup
+- 7b438e62: test: Add 2 hubble sync+gossip test
+- e8b2dafa: fix: Fix flaky pruneMessagesJob test
+- 0bc82ce4: test: Fix broken test due to Link storage limits change
+- 82c996af: fix: Grafana: Sync times are blank for longer timeranges
+- 7e2a66e5: feat: Add a function to parse the timestamp from the eventId
+- 520843ba: feat: Move libp2p to worker thread
+- d77970b1: chore: Delete deprecated rpc calls and events
+- Updated dependencies [d77970b1]
+  - @farcaster/hub-nodejs@0.10.9
+
+## 1.5.4
+
+### Patch Changes
+
+- 0805122c: fix: Grafana issue where incoming sync count was not correct
+- 4893e02d: fix: Update links store size to be 2500 in the future
+- 5dc7d113: chore: Remove GossipMetricsRecorder (Use grafana dashboard instead)
+- 8d21803e: feat: Add "up" and "down" commands to hubble.sh
+  - @farcaster/hub-nodejs@0.10.8
+
+## 1.5.3
+
+### Patch Changes
+
+- 08b652e: fix: Add txIndex to onchain events, fix wrong index being used in the primary key
+- b36eef2: fix: Extract snapshot on the fly while downloading snapshot
+- 93e43a8: fix: Use hashes to compare upgrade 'hubble.sh' versions
+- 7daaae4: fix: Simplify IP addr fetching, prefering ipv4
+- ac1f6ac: fix: Fetch envoy config during hubble.sh
+- baf983f: fix: Consume the FID rate limit only after a successful merge
+- Updated dependencies [08b652e]
+  - @farcaster/hub-nodejs@0.10.7
+
+## 1.5.2
+
+### Patch Changes
+
+- 2f2dd83d: feat: Snapshot sync
+- 40e017fe: fix: Fix progress bar for docker (non-TTY)
+- 6c12fee5: fix: Add custom linter for Grafana JSON
+- cff71488: chore: Remove Goerli RPC url and signer message logic
+- 52260bc8: chore: Deprecate "status" command
+- 0f83be8f: fix: Reformat grafana dashboard with descriptions
+- 316bcd3a: chore: Remove signer pre-sync for initial sync
+- 3c32cf21: fix: Supress progress logs during tests
+- 2ab99d95: feat: Add REST API
+- 7fd1f945: fix: Add progress bar for storage cache
+- aac4220f: chore: Add cli options documentation linter
+- 5cb9db86: feat: Sync latest messages first
+- bc416dbe: feat: Allow Hub operators to set an FID
+- 5e5cfb15: fix: Ensure index keys are > UserMessagePostfixMax
+- ef65fd40: fix: Count peer validation errors during sync
+- bab7bba9: chore: Update the Grafana dashboard
+- 76a031e2: feat: Add storage limit constants to core
+- Updated dependencies [2ab99d95]
+- Updated dependencies [bc416dbe]
+- Updated dependencies [76a031e2]
+  - @farcaster/hub-nodejs@0.10.6
+
+## 1.5.1
+
+### Patch Changes
+
+- 9138ca9e: chore: Improve dashboard with sync %, versions
+- 8ea938ab: fix: Handle both 'docker-compose' and 'docker compose' in hubble.sh
+- 05e5ed1e: fix: Stream buffer size to 5K and correct store size limits
+
+## 1.5.0
+
+### Minor Changes
+
+- be6ee3c8: feat: Make l2 rpc url required to start hubble ahead of mainnet migration
+
+### Patch Changes
+
+- ee3897f3: feat: Add startup checks and progress bars
+- 01a3c08e: feat: fetch l2 contract addresses from network config
+- b50024c8: fix: Improve startup checks to be clearer
+- 315a0873: feat: add an events-reset command to clear l2 events from the db
+- 74313c17: Switch startup checks to check against OP Mainnet
+- a3d6b21e: fix: Cleanup startup checks and add cleaner exit failures
+- e6180074: feat: enforce storage pruning 1 day after migration
+- a508e56f: chore: Improve gen.submitMessages() for testing
+- 930d8635: chore: Update the Grafana dashboard
+- 7a969943: fix: Improve logging for DB migration failures
+- 27287d2d: feat: hubble.sh script to install and upgrade hubble
+- bf1c44d2: feat: Update signer onchain event to store new fields and add additional RPC calls
+- acfb44d7: feat: SyncEngine syncs from L2 if required post migration
+- Updated dependencies [bf1c44d2]
+  - @farcaster/hub-nodejs@0.10.5
+
+## 1.4.6
+
+### Patch Changes
+
+- e55e571f: feat: Add "getting blockchain events" to hub status
+- 5e96e134: fix: Handle network failures when fetching config
+- 951793b1: fix: getUserNameProofsByFid should return fname proofs as well
+- 3e601f81: fix: Fetch L2 events in parallel before processing, show progress
+- 6ec14935: feat: Remove permissioned allowlist for mainnet hubs
+- c61728cb: fix: DB Migration for UserNameProof index messages
+- 6bb1b439: fix: Handle sync status reporting properly
+- 1fcfd495: fix: fetching l2 events was not respecting --l2-first-block
+- f9631488: feat: Add statsd monitoring for Hubble
+- c6d79cdb: feat: on chain event ordering updated to be more consistent
+- f241dcf4: fix: Make sure valid messages are inserted into Sync Trie
+- 36484022: fix: user name proofs weren't syncd correctly because they were not added to the sync trie
+- 8d61f5f2: fix: Improve initial eth events fetching
+- d8cb39ac: fix: Limit SyncStatus to upto 30 peers
+- Updated dependencies [e55e571f]
+- Updated dependencies [c6d79cdb]
+  - @farcaster/hub-nodejs@0.10.4
+
 ## 1.4.5
 
 ### Patch Changes

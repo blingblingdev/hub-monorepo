@@ -18,6 +18,9 @@ export type NetworkConfig = {
   allowedPeers: string[] | undefined;
   deniedPeers: string[];
   minAppVersion: string;
+  storageRegistryAddress: `0x${string}` | undefined;
+  keyRegistryAddress: `0x${string}` | undefined;
+  idRegistryAddress: `0x${string}` | undefined;
 };
 
 export type NetworkConfigResult = {
@@ -48,7 +51,7 @@ export async function fetchNetworkConfig(): HubAsyncResult<NetworkConfig> {
             return;
           }
 
-          // rome-ignore lint/suspicious/noExplicitAny: context has to be "any"
+          // biome-ignore lint/suspicious/noExplicitAny: context has to be "any"
           const context: any = {};
 
           const result = Result.fromThrowable(
@@ -97,14 +100,14 @@ export function applyNetworkConfig(
     log.error({ networkConfig }, "invalid minAppVersion");
   }
 
-  let newPeerIdList: string[] | undefined = undefined;
+  let newPeerIdList: string[] | undefined = allowedPeerIds;
   let newDeniedPeerIdList: string[] = [];
 
   if (networkConfig.allowedPeers) {
     // Add the network.allowedPeers to the list of allowed peers
     newPeerIdList = [...new Set([...(allowedPeerIds ?? []), ...networkConfig.allowedPeers])];
   } else {
-    log.error({ networkConfig }, "network config does not contain 'allowedPeers'");
+    log.info({ networkConfig }, "network config does not contain 'allowedPeers'");
   }
 
   // Then remove the denied peers from this list
@@ -112,7 +115,7 @@ export function applyNetworkConfig(
     newPeerIdList = newPeerIdList?.filter((peerId) => !networkConfig.deniedPeers.includes(peerId));
     newDeniedPeerIdList = [...new Set([...deniedPeerIds, ...networkConfig.deniedPeers])];
   } else {
-    log.error({ networkConfig }, "network config does not contain 'deniedPeers'");
+    log.info({ networkConfig }, "network config does not contain 'deniedPeers'");
   }
 
   return { allowedPeerIds: newPeerIdList, deniedPeerIds: newDeniedPeerIdList, shouldExit: false };

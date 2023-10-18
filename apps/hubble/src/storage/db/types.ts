@@ -31,22 +31,19 @@ export enum RootPrefix {
   LinksByTarget = 4,
   /* Used to index reactions by target  */
   ReactionsByTarget = 5,
-  /* Used to store custody events */
-  IdRegistryEvent = 6,
-  /* Used to store name registry events */
-  NameRegistryEvent = 7,
-  /* Used to store custody events by custody address */
-  IdRegistryEventByCustodyAddress = 8,
+  /* Deprecated */
+  // IdRegistryEvent = 6,
+  // NameRegistryEvent = 7,
+  // IdRegistryEventByCustodyAddress = 8,
   /* Used to store the state of the hub */
   HubState = 9,
   /* Revoke signer jobs */
   JobRevokeMessageBySigner = 10,
   /* Sync Merkle Trie Node */
   SyncMerkleTrieNode = 11,
-  /* Update NameRegistryEvent expiry job */
-  JobUpdateNameExpiry = 12,
-  /* Index name registry events by expiry */
-  NameRegistryEventsByExpiry = 13,
+  /* Deprecated */
+  // JobUpdateNameExpiry = 12,
+  // NameRegistryEventsByExpiry = 13,
   /* To check if the Hub was cleanly shutdown */
   HubCleanShutdown = 14,
   /* Event log */
@@ -56,7 +53,9 @@ export enum RootPrefix {
   /* Used to store fname server name proofs */
   FNameUserNameProof = 17,
   /* Used to store gossip network metrics */
-  GossipMetrics = 18,
+  // Deprecated, DO NOT USE
+  // GossipMetrics = 18,
+
   /* Used to index user submited username proofs */
   UserNameProofByName = 19,
 
@@ -67,6 +66,15 @@ export enum RootPrefix {
 
   /* Used to store on chain events */
   OnChainEvent = 23,
+
+  /** DB Schema version */
+  DBSchemaVersion = 24,
+
+  /* Used to index fname username proofs by fid */
+  FNameUserNameProofByFid = 25,
+
+  /* Used to index verifications by address */
+  VerificationByAddress = 25,
 }
 
 /**
@@ -84,9 +92,14 @@ export enum UserPostfix {
   LinkMessage = 2,
   ReactionMessage = 3,
   VerificationMessage = 4,
-  SignerMessage = 5,
+  // Deprecated
+  // SignerMessage = 5,
   UserDataMessage = 6,
   UsernameProofMessage = 7,
+
+  // Add new message types here
+  // NOTE: If you add a new message type, make sure that it is only used to store Message protobufs.
+  // If you need to store an index, use one of the UserPostfix values below (>86).
 
   /** Index records (must be 86-255) */
 
@@ -108,12 +121,15 @@ export enum UserPostfix {
   VerificationAdds = 93,
   VerificationRemoves = 94,
 
-  /* SignerStore add and remove sets */
-  SignerAdds = 95,
-  SignerRemoves = 96,
+  /* Deprecated */
+  // SignerAdds = 95,
+  // SignerRemoves = 96,
 
   /* UserDataStore add set */
   UserDataAdds = 97,
+
+  /* UserNameProof add set */
+  UserNameProofAdds = 99,
 }
 
 export enum OnChainEventPostfix {
@@ -135,7 +151,6 @@ export type UserMessagePostfix =
   | UserPostfix.CastMessage
   | UserPostfix.LinkMessage
   | UserPostfix.VerificationMessage
-  | UserPostfix.SignerMessage
   | UserPostfix.ReactionMessage
   | UserPostfix.UserDataMessage
   | UserPostfix.UsernameProofMessage;

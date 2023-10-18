@@ -1,17 +1,16 @@
 import { jest } from "@jest/globals";
 import {
-  Ed25519Signer,
   Factories,
   getInsecureHubRpcClient,
   HubRpcClient,
   FarcasterNetwork,
-  IdRegistryEvent,
-  SignerAddMessage,
-  CastAddMessage,
   Message,
   TrieNodePrefix,
   HubInfoRequest,
   getFarcasterTime,
+  OnChainEvent,
+  UserNameProof,
+  MessageData,
 } from "@farcaster/hub-nodejs";
 import { APP_NICKNAME, APP_VERSION, HubInterface } from "../../hubble.js";
 import SyncEngine from "./syncEngine.js";
@@ -21,11 +20,12 @@ import { jestRocksDB } from "../../storage/db/jestUtils.js";
 import Engine from "../../storage/engine/index.js";
 import { MockHub } from "../../test/mocks.js";
 import { sleep, sleepWhile } from "../../utils/crypto.js";
-import { EthEventsProvider } from "../../eth/ethEventsProvider.js";
-import { deployIdRegistry, deployNameRegistry, publicClient } from "../../test/utils.js";
 import { EMPTY_HASH } from "./trieNode.js";
+import { ensureMessageData } from "../../storage/db/message.js";
 
+const TEST_TIMEOUT_SHORT = 10 * 1000;
 const TEST_TIMEOUT_LONG = 60 * 1000;
+const SLEEPWHILE_TIMEOUT = 10 * 1000;
 
 const testDb1 = jestRocksDB("engine1.peersyncEngine.test");
 const testDb2 = jestRocksDB("engine2.peersyncEngine.test");
@@ -36,21 +36,43 @@ const fid = Factories.Fid.build();
 const signer = Factories.Ed25519Signer.build();
 const custodySigner = Factories.Eip712Signer.build();
 
-let custodyEvent: IdRegistryEvent;
-let signerAdd: SignerAddMessage;
+let custodyEvent: OnChainEvent;
+let signerEvent: OnChainEvent;
+let storageEvent: OnChainEvent;
+let castAdd: Message;
+let fname: UserNameProof;
+
+const eventsByBlock = new Map<number, OnChainEvent>();
+// biome-ignore lint/suspicious/noExplicitAny: mock used only in tests
+const l2EventsProvider = jest.fn() as any;
+l2EventsProvider.retryEventsFromBlock = jest.fn();
+const retryEventsMock = l2EventsProvider.retryEventsFromBlock;
+
+// biome-ignore lint/suspicious/noExplicitAny: mock used only in tests
+const fnameEventsProvider = jest.fn() as any;
+fnameEventsProvider.retryTransferByName = jest.fn();
+const retryTransferByName = fnameEventsProvider.retryTransferByName;
 
 beforeAll(async () => {
   const custodySignerKey = (await custodySigner.getSignerKey())._unsafeUnwrap();
   const signerKey = (await signer.getSignerKey())._unsafeUnwrap();
-  custodyEvent = Factories.IdRegistryEvent.build({ fid, to: custodySignerKey });
+  custodyEvent = Factories.IdRegistryOnChainEvent.build({ fid }, { transient: { to: custodySignerKey } });
 
-  signerAdd = await Factories.SignerAddMessage.create(
-    { data: { fid, network, signerAddBody: { signer: signerKey } } },
-    { transient: { signer: custodySigner } },
+  signerEvent = Factories.SignerOnChainEvent.build(
+    { fid, blockNumber: custodyEvent.blockNumber + 1 },
+    { transient: { signer: signerKey } },
   );
+  storageEvent = Factories.StorageRentOnChainEvent.build({ fid, blockNumber: custodyEvent.blockNumber + 2 });
+  castAdd = await Factories.CastAddMessage.create({ data: { fid, network } }, { transient: { signer } });
+  fname = Factories.UserNameProof.build({ fid });
+
+  eventsByBlock.set(custodyEvent.blockNumber, custodyEvent);
+  eventsByBlock.set(signerEvent.blockNumber, signerEvent);
+  eventsByBlock.set(storageEvent.blockNumber, storageEvent);
 });
 
 describe("Multi peer sync engine", () => {
+  jest.setTimeout(TEST_TIMEOUT_LONG);
   const addMessagesWithTimeDelta = async (engine: Engine, timeDelta: number[]) => {
     return await Promise.all(
       timeDelta.map(async (t) => {
@@ -61,9 +83,12 @@ describe("Multi peer sync engine", () => {
         );
 
         const result = await engine.mergeMessage(cast);
+        if (result.isErr()) {
+          throw result.error;
+        }
         expect(result.isOk()).toBeTruthy();
 
-        return Promise.resolve(cast);
+        return cast;
       }),
     );
   };
@@ -98,16 +123,37 @@ describe("Multi peer sync engine", () => {
   let port1;
   let clientForServer1: HubRpcClient;
 
+  let engine2: Engine;
+  let hub2: HubInterface;
+  let syncEngine2: SyncEngine;
+
   beforeEach(async () => {
+    jest.clearAllMocks();
     // Engine 1 is where we add events, and see if engine 2 will sync them
     engine1 = new Engine(testDb1, network);
     hub1 = new MockHub(testDb1, engine1);
     syncEngine1 = new SyncEngine(hub1, testDb1);
-    syncEngine1.initialize();
+    await syncEngine1.start();
     server1 = new Server(hub1, engine1, syncEngine1);
     port1 = await server1.start();
     clientForServer1 = getInsecureHubRpcClient(`127.0.0.1:${port1}`);
-  });
+
+    retryEventsMock.mockImplementation(async (blockNumber: number) => {
+      const event = eventsByBlock.get(blockNumber);
+      if (event) {
+        return engine2.mergeOnChainEvent(event);
+      } else {
+        throw new Error(`Block ${blockNumber} not found`);
+      }
+    });
+    retryTransferByName.mockImplementation(async (name: Uint8Array) => {
+      expect(name).toEqual(fname.name);
+      await engine2.mergeUserNameProof(fname);
+    });
+    engine2 = new Engine(testDb2, network);
+    hub2 = new MockHub(testDb2, engine2);
+    syncEngine2 = new SyncEngine(hub2, testDb2, l2EventsProvider, fnameEventsProvider);
+  }, TEST_TIMEOUT_SHORT);
 
   afterEach(async () => {
     // Cleanup
@@ -115,12 +161,15 @@ describe("Multi peer sync engine", () => {
     await server1.stop();
     await syncEngine1.stop();
     await engine1.stop();
-  });
+
+    await syncEngine2.stop();
+    await engine2.stop();
+  }, TEST_TIMEOUT_SHORT);
 
   test("toBytes test", async () => {
     // Add signer custody event to engine 1
-    await engine1.mergeIdRegistryEvent(custodyEvent);
-    await engine1.mergeMessage(signerAdd);
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
 
     // Get info first
     const info = await clientForServer1.getInfo(HubInfoRequest.create());
@@ -130,19 +179,19 @@ describe("Multi peer sync engine", () => {
     expect(infoResult.nickname).toEqual(APP_NICKNAME);
 
     // Fetch the signerAdd message from engine 1
-    const rpcResult = await clientForServer1.getAllSignerMessagesByFid({ fid });
+    const rpcResult = await clientForServer1.getOnChainSignersByFid({ fid });
     expect(rpcResult.isOk()).toBeTruthy();
-    expect(rpcResult._unsafeUnwrap().messages.length).toEqual(1);
-    const rpcSignerAdd = rpcResult._unsafeUnwrap().messages[0] as SignerAddMessage;
+    expect(rpcResult._unsafeUnwrap().events.length).toEqual(1);
+    const rpcSignerAdd = rpcResult._unsafeUnwrap().events[0] as OnChainEvent;
 
-    expect(Message.toJSON(signerAdd)).toEqual(Message.toJSON(rpcSignerAdd));
-    expect(signerAdd.data?.fid).toEqual(rpcSignerAdd.data?.fid);
+    expect(OnChainEvent.toJSON(signerEvent)).toEqual(OnChainEvent.toJSON(rpcSignerAdd));
+    expect(signerEvent.fid).toEqual(rpcSignerAdd.fid);
 
     // Create a new sync engine from the existing engine, and see if all the messages from the engine
     // are loaded into the sync engine Merkle Trie properly.
     await syncEngine1.trie.commitToDb();
     const reinitSyncEngine = new SyncEngine(hub1, testDb1);
-    await reinitSyncEngine.initialize();
+    await reinitSyncEngine.start();
 
     expect(await reinitSyncEngine.trie.rootHash()).toEqual(await syncEngine1.trie.rootHash());
 
@@ -153,21 +202,16 @@ describe("Multi peer sync engine", () => {
     "two peers should sync",
     async () => {
       // Add signer custody event to engine 1
-      await engine1.mergeIdRegistryEvent(custodyEvent);
-      await engine1.mergeMessage(signerAdd);
+      await expect(engine1.mergeOnChainEvent(custodyEvent)).resolves.toBeDefined();
+      await expect(engine1.mergeOnChainEvent(signerEvent)).resolves.toBeDefined();
+      await expect(engine1.mergeOnChainEvent(storageEvent)).resolves.toBeDefined();
+      await expect(engine1.mergeUserNameProof(fname)).resolves.toBeDefined();
 
       // Add messages to engine 1
       await addMessagesWithTimeDelta(engine1, [167, 169, 172]);
-      await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
+      await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
-      const engine2 = new Engine(testDb2, network);
-      const hub2 = new MockHub(testDb2, engine2);
-      const syncEngine2 = new SyncEngine(hub2, testDb2);
-
-      // Add the signer custody event to engine 2
-      await engine2.mergeIdRegistryEvent(custodyEvent);
-
-      // Engine 2 should sync with engine1
+      // Engine 2 should sync with engine1 (inlcuding onchain events and fnames)
       expect(
         (await syncEngine2.syncStatus("engine2", (await syncEngine1.getSnapshot())._unsafeUnwrap()))._unsafeUnwrap()
           .shouldSync,
@@ -187,7 +231,13 @@ describe("Multi peer sync engine", () => {
 
       // Add more messages
       await addMessagesWithTimeDelta(engine1, [367, 369, 372]);
-      await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
+      // Add a message with data_bytes to make sure it gets synced OK.
+      const castAddClone = Message.decode(Message.encode(castAdd).finish());
+      castAddClone.data = undefined;
+      castAddClone.dataBytes = MessageData.encode(castAdd.data as MessageData).finish();
+      const result = await engine1.mergeMessage(ensureMessageData(castAddClone));
+      expect(result.isOk()).toBeTruthy();
+      await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
       // grab a new snapshot from the RPC for engine1
       const newSnapshotResult = await clientForServer1.getSyncSnapshotByPrefix(TrieNodePrefix.create());
@@ -203,43 +253,51 @@ describe("Multi peer sync engine", () => {
       // Should sync should now be true
       expect((await syncEngine2.syncStatus("engine1", newSnapshot))._unsafeUnwrap().shouldSync).toBeTruthy();
 
-      // Do the sync again
-      await syncEngine2.performSync("engine1", newSnapshot, clientForServer1);
+      // Do the sync again, this time enabling audit
+      await syncEngine2.performSync("engine1", newSnapshot, clientForServer1, true);
 
       // Make sure root hash matches
       expect(await syncEngine1.trie.rootHash()).toEqual(await syncEngine2.trie.rootHash());
 
-      await syncEngine2.stop();
-      await engine2.stop();
+      expect(syncEngine2.trie.exists(SyncId.fromFName(fname))).toBeTruthy();
+      expect(syncEngine2.trie.exists(SyncId.fromOnChainEvent(storageEvent))).toBeTruthy();
+      expect(syncEngine2.trie.exists(SyncId.fromMessage(castAddClone))).toBeTruthy();
+
+      // Sync again, and this time the audit should increase the peer score
+      // First, get the existing peer score
+      const peerScoreBefore = syncEngine2.getPeerScore("engine1");
+
+      // Now sync again
+      await syncEngine2.performSync("engine1", newSnapshot, clientForServer1, true);
+
+      // Make sure root hash matches and peer score has increased
+      expect(await syncEngine1.trie.rootHash()).toEqual(await syncEngine2.trie.rootHash());
+      const peerScoreAfter = syncEngine2.getPeerScore("engine1");
+      expect(peerScoreAfter).toBeDefined();
+      expect(peerScoreAfter?.score).toBeGreaterThan(peerScoreBefore?.score ?? Infinity);
     },
     TEST_TIMEOUT_LONG,
   );
 
   test("cast remove should remove from trie", async () => {
     // Add signer custody event to engine 1
-    await engine1.mergeIdRegistryEvent(custodyEvent);
-    await engine1.mergeMessage(signerAdd);
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
+    await engine1.mergeOnChainEvent(storageEvent);
 
     // Add a cast to engine1
     const castAdd = (await addMessagesWithTimeDelta(engine1, [167]))[0] as Message;
-    await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
-
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-    const syncEngine2 = new SyncEngine(hub2, testDb2);
-
-    // Add the signer custody event to engine 2
-    await engine2.mergeIdRegistryEvent(custodyEvent);
+    await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
     // Sync engine 2 with engine 1
     await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
-    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, 1000);
+    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
     expect(await syncEngine2.trie.rootHash()).toEqual(await syncEngine1.trie.rootHash());
 
     // Make sure the castAdd is in the trie
-    expect(await syncEngine1.trie.exists(new SyncId(castAdd))).toBeTruthy();
-    expect(await syncEngine2.trie.exists(new SyncId(castAdd))).toBeTruthy();
+    expect(await syncEngine1.trie.exists(SyncId.fromMessage(castAdd))).toBeTruthy();
+    expect(await syncEngine2.trie.exists(SyncId.fromMessage(castAdd))).toBeTruthy();
 
     const castRemove = await Factories.CastRemoveMessage.create(
       {
@@ -255,14 +313,14 @@ describe("Multi peer sync engine", () => {
 
     // Merging the cast remove deletes the cast add in the db, and it should be reflected in the trie
     const result = await engine1.mergeMessage(castRemove);
-    await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
+    await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
     expect(result.isOk()).toBeTruthy();
 
-    const castRemoveId = new SyncId(castRemove);
+    const castRemoveId = SyncId.fromMessage(castRemove);
     expect(await syncEngine1.trie.exists(castRemoveId)).toBeTruthy();
     // The trie should not contain the castAdd anymore
-    expect(await syncEngine1.trie.exists(new SyncId(castAdd))).toBeFalsy();
+    expect(await syncEngine1.trie.exists(SyncId.fromMessage(castAdd))).toBeFalsy();
 
     // Syncing engine2 --> engine1 should do nothing, even though engine2 has the castAdd and it has been removed
     // from engine1.
@@ -273,7 +331,7 @@ describe("Multi peer sync engine", () => {
       const engine1RootHashBefore = await syncEngine1.trie.rootHash();
 
       await syncEngine1.performSync("engine2", (await syncEngine2.getSnapshot())._unsafeUnwrap(), clientForServer2);
-      await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
+      await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
       expect(await syncEngine1.trie.rootHash()).toEqual(engine1RootHashBefore);
 
@@ -285,10 +343,10 @@ describe("Multi peer sync engine", () => {
     expect(await syncEngine2.trie.exists(castRemoveId)).toBeFalsy();
 
     await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
-    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, 1000);
+    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
     expect(await syncEngine2.trie.exists(castRemoveId)).toBeTruthy();
-    expect(await syncEngine2.trie.exists(new SyncId(castAdd))).toBeFalsy();
+    expect(await syncEngine2.trie.exists(SyncId.fromMessage(castAdd))).toBeFalsy();
 
     expect(await syncEngine2.trie.rootHash()).toEqual(await syncEngine1.trie.rootHash());
 
@@ -296,26 +354,58 @@ describe("Multi peer sync engine", () => {
     // because it has already been removed, so adding it is a no-op
     const beforeRootHash = await syncEngine2.trie.rootHash();
     await engine2.mergeMessage(castAdd);
-    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, 1000);
+    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
     expect(await syncEngine2.trie.rootHash()).toEqual(beforeRootHash);
+  });
 
-    await syncEngine2.stop();
-    await engine2.stop();
+  test("audit should fail if peer withholds messages", async () => {
+    await expect(engine1.mergeOnChainEvent(custodyEvent)).resolves.toBeDefined();
+    await expect(engine1.mergeOnChainEvent(signerEvent)).resolves.toBeDefined();
+    await expect(engine1.mergeOnChainEvent(storageEvent)).resolves.toBeDefined();
+    await expect(engine1.mergeUserNameProof(fname)).resolves.toBeDefined();
+
+    // Add messages to engine 1
+    await addMessagesWithTimeDelta(engine1, [167]);
+    await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
+
+    // Sync engine 2 with engine 1
+    await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
+
+    // Make sure root hash matches
+    expect(await syncEngine1.trie.rootHash()).toEqual(await syncEngine2.trie.rootHash());
+
+    // Now, delete the messages from engine 1
+    await engine1.getDb().clear();
+    const allValues = await syncEngine1.trie.getAllValues(new Uint8Array());
+    for (const value of allValues) {
+      await syncEngine1.trie.deleteByBytes(value);
+    }
+
+    // Now, engine 1 should have no messages
+    expect((await syncEngine1.trie.getTrieNodeMetadata(new Uint8Array()))?.numMessages).toEqual(0);
+
+    const startScore = syncEngine2.getPeerScore("engine1")?.score ?? 0;
+
+    // Sync engine 2 with engine 1, but this time the audit will fail
+    await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1, true);
+
+    // Check the peer score to make sure it reduced
+    const peerScore = syncEngine2.getPeerScore("engine1");
+    expect(peerScore).toBeDefined();
+    expect(peerScore?.score).toBeLessThan(startScore);
   });
 
   test("shouldn't fetch messages that already exist", async () => {
-    // Engine1 has 1 message
-    await engine1.mergeIdRegistryEvent(custodyEvent);
-    await engine1.mergeMessage(signerAdd);
-
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-    const syncEngine2 = new SyncEngine(hub2, testDb2);
+    // Engine1 has no messages
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
+    await engine1.mergeOnChainEvent(storageEvent);
 
     // Engine2 has 2 messages
-    await engine2.mergeIdRegistryEvent(custodyEvent);
-    await engine2.mergeMessage(signerAdd);
+    await engine2.mergeOnChainEvent(custodyEvent);
+    await engine2.mergeOnChainEvent(signerEvent);
+    await engine2.mergeOnChainEvent(storageEvent);
     await addMessagesWithTimeDelta(engine2, [167]);
 
     // Syncing engine2 --> engine1 should not fetch any additional messages, since engine2 already
@@ -326,179 +416,135 @@ describe("Multi peer sync engine", () => {
 
       expect(fetchMessagesSpy).not.toHaveBeenCalled();
     }
-
-    await syncEngine2.stop();
-    await engine2.stop();
   });
 
   test("should fetch only the exact missing message", async () => {
-    // Engine1 has 2 message
-    await engine1.mergeIdRegistryEvent(custodyEvent);
-    await engine1.mergeMessage(signerAdd);
+    // Engine1 has 1 message
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
+    await engine1.mergeOnChainEvent(storageEvent);
     const msgs = await addMessagesWithTimeDelta(engine1, [167]);
 
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-    const syncEngine2 = new SyncEngine(hub2, testDb2);
-
-    // Engine2 has 1 messages
-    await engine2.mergeIdRegistryEvent(custodyEvent);
-    await engine2.mergeMessage(signerAdd);
-
+    // Engine2 has no messages
     // Syncing engine2 --> engine1 should fetch only the missing message
     {
       const fetchMessagesSpy = jest.spyOn(syncEngine1, "getAllMessagesBySyncIds");
       await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
 
       expect(fetchMessagesSpy).toHaveBeenCalledTimes(1);
-      expect(fetchMessagesSpy).toHaveBeenCalledWith([new SyncId(msgs[0] as Message).syncId()]);
+      expect(fetchMessagesSpy).toHaveBeenCalledWith([SyncId.fromMessage(msgs[0] as Message)]);
 
       // Also assert the root hashes are the same
       expect(await syncEngine2.trie.rootHash()).toEqual(await syncEngine1.trie.rootHash());
     }
-
-    await syncEngine2.stop();
-    await engine2.stop();
   });
 
-  test("retries the id registry event if it is missing", async () => {
-    await engine1.mergeIdRegistryEvent(custodyEvent);
-    await engine1.mergeMessage(signerAdd);
+  test("retries the event blocks if it's missing", async () => {
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
+    await engine1.mergeOnChainEvent(storageEvent);
 
-    // Add a cast to engine1
-    await addMessagesWithTimeDelta(engine1, [167]);
-
-    // Do not merge the custory event into engine2
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-
-    const { contractAddress: idRegistryAddress } = await deployIdRegistry();
-    if (!idRegistryAddress) throw new Error("Failed to deploy NameRegistry contract");
-
-    const { contractAddress: nameRegistryAddress } = await deployNameRegistry();
-    if (!nameRegistryAddress) throw new Error("Failed to deploy NameRegistry contract");
-
-    const ethEventsProvider = new EthEventsProvider(
-      hub2,
-      publicClient,
-      idRegistryAddress,
-      nameRegistryAddress,
-      1,
-      10000,
-      false,
-    );
-    const syncEngine2 = new SyncEngine(hub2, testDb2, ethEventsProvider);
-    const retrySpy = jest.spyOn(ethEventsProvider, "retryEventsFromBlock");
-
-    // Sync engine 2 with engine 1
     await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
 
     // Because do it without awaiting, we need to wait for the promise to resolve
     await sleep(100);
-    expect(retrySpy).toHaveBeenCalled();
+    expect(retryEventsMock).toHaveBeenCalledWith(custodyEvent.blockNumber);
+    expect(retryEventsMock).toHaveBeenCalledWith(signerEvent.blockNumber);
+    expect(retryEventsMock).toHaveBeenCalledWith(storageEvent.blockNumber);
   });
 
-  test("Merge with multiple signers", async () => {
-    await engine1.mergeIdRegistryEvent(custodyEvent);
+  test("does not retry any block if all events are present", async () => {
+    await engine2.mergeOnChainEvent(custodyEvent);
+    await engine2.mergeOnChainEvent(signerEvent);
+    await engine2.mergeOnChainEvent(storageEvent);
+    await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
 
-    // Create 5 different signers
-    const signers: Ed25519Signer[] = await Promise.all(
-      Array.from({ length: 5 }, async (_) => {
-        const signer = Factories.Ed25519Signer.build();
-        const signerKey = (await signer.getSignerKey())._unsafeUnwrap();
-        const signerAdd = await Factories.SignerAddMessage.create(
-          { data: { fid, network, signerAddBody: { signer: signerKey } } },
-          { transient: { signer: custodySigner } },
-        );
-        await engine1.mergeMessage(signerAdd);
-        return signer;
-      }),
-    );
-
-    // Create 2 messages for each signer
-    const castAdds: CastAddMessage[] = [];
-    for (const signer of signers) {
-      for (let i = 0; i < 2; i++) {
-        const castAdd = await Factories.CastAddMessage.create({ data: { fid, network } }, { transient: { signer } });
-        await engine1.mergeMessage(castAdd);
-        castAdds.push(castAdd);
-      }
-    }
-
-    // Make sure all messages exist
-    castAdds.forEach((castAdd) => {
-      expect(syncEngine1.trie.exists(new SyncId(castAdd))).toBeTruthy();
-    });
-
-    // Create a new sync engine with a new test db
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-    await engine2.mergeIdRegistryEvent(custodyEvent);
-
-    const syncEngine2 = new SyncEngine(hub2, testDb2);
-    await syncEngine2.initialize();
-
-    // Try to merge all the messages, to see if it fetches the right signers
-    const results = await syncEngine2.mergeMessages(castAdds, clientForServer1);
-    expect(results.total).toEqual(castAdds.length);
-    expect(results.successCount).toEqual(castAdds.length);
-    expect(results.deferredCount).toEqual(0);
-    expect(results.errCount).toEqual(0);
-
-    // Make sure all messages exist
-    castAdds.forEach((castAdd) => {
-      expect(syncEngine2.trie.exists(new SyncId(castAdd))).toBeTruthy();
-    });
-
-    // Make sure the root hashes are the same
-    expect(await syncEngine1.trie.rootHash()).toEqual(await syncEngine2.trie.rootHash());
-    expect(await syncEngine1.trie.items()).toEqual(await syncEngine2.trie.items());
-
-    await syncEngine2.stop();
-    await engine2.stop();
+    // Because do it without awaiting, we need to wait for the promise to resolve
+    await sleep(100);
+    expect(retryEventsMock).not.toHaveBeenCalled();
   });
 
   test("recovers if there are missing messages in the engine", async () => {
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-    const syncEngine2 = new SyncEngine(hub2, testDb2);
-    await syncEngine2.initialize();
-
     // Add a message to engine1 synctrie, but not to the engine itself.
-    syncEngine1.trie.insert(new SyncId(signerAdd));
+    await syncEngine1.trie.insert(SyncId.fromMessage(castAdd));
 
     // Attempt to sync engine2 <-- engine1.
     await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
 
     // Since the message is actually missing, it should be a no-op, and the missing message should disappear
     // from the sync trie
-    sleepWhile(async () => (await syncEngine2.trie.exists(new SyncId(signerAdd))) === true, 1000);
-    expect(await syncEngine2.trie.exists(new SyncId(signerAdd))).toBeFalsy();
+    await sleepWhile(
+      async () => (await syncEngine2.trie.exists(SyncId.fromMessage(castAdd))) === true,
+      SLEEPWHILE_TIMEOUT,
+    );
+    expect(await syncEngine2.trie.exists(SyncId.fromMessage(castAdd))).toBeFalsy();
 
     // The root hashes should be the same, since nothing actually happened
     expect(await syncEngine1.trie.items()).toEqual(await syncEngine2.trie.items());
     expect(await syncEngine1.trie.rootHash()).toEqual(EMPTY_HASH);
   });
 
-  test("recovers if messages are missing from the sync trie", async () => {
-    await engine1.mergeIdRegistryEvent(custodyEvent);
-    await engine1.mergeMessage(signerAdd);
+  test("recovers if there are missing messages in the engine during sync", async () => {
+    await engine2.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(custodyEvent);
 
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-    const syncEngine2 = new SyncEngine(hub2, testDb2);
-    await syncEngine2.initialize();
+    await engine2.mergeOnChainEvent(signerEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
+
+    await engine1.mergeOnChainEvent(storageEvent);
+    await engine2.mergeOnChainEvent(storageEvent);
+
+    const initialEngine1Count = await syncEngine1.trie.items();
+    const initialEngine2Count = await syncEngine1.trie.items();
+    // We'll get 2 CastAdds
+    const castAdd1 = await Factories.CastAddMessage.create({ data: { fid, network } }, { transient: { signer } });
+    const castAdd2 = await Factories.CastAddMessage.create({ data: { fid, network } }, { transient: { signer } });
+
+    // CastAdd1 is added properly to both
+    expect(await engine2.mergeMessage(castAdd1)).toBeTruthy();
+    expect(await engine1.mergeMessage(castAdd1)).toBeTruthy();
+
+    // CastAdd2 is added only to the sync trie, but is missing from the engine
+    await syncEngine2.trie.insert(SyncId.fromMessage(castAdd2));
+
+    // Wait for the sync trie to be updated
+    await sleepWhile(async () => (await syncEngine2.trie.items()) !== initialEngine2Count + 2, SLEEPWHILE_TIMEOUT);
+    await sleepWhile(async () => (await syncEngine1.trie.items()) !== initialEngine1Count + 1, SLEEPWHILE_TIMEOUT);
+
+    // Attempt to sync engine2 <-- engine1. Engine1 has only singerAdd
+    await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
+
+    // The sync engine should realize that castAdd2 is not in it's engine, so it should be removed from the sync trie
+    await sleepWhile(async () => (await syncEngine2.trie.exists(SyncId.fromMessage(castAdd2))) === true, 1000);
+
+    expect(await syncEngine2.trie.exists(SyncId.fromMessage(castAdd2))).toBeFalsy();
+
+    // but the castAdd1 should still be there
+    expect(await syncEngine2.trie.exists(SyncId.fromMessage(castAdd1))).toBeTruthy();
+  });
+
+  test("recovers if messages are missing from the sync trie", async () => {
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
+    await engine1.mergeOnChainEvent(storageEvent);
+    await engine1.mergeUserNameProof(fname);
 
     // We add it to the engine2 synctrie as normal...
-    await engine2.mergeIdRegistryEvent(custodyEvent);
-    await engine2.mergeMessage(signerAdd);
+    await engine2.mergeOnChainEvent(custodyEvent);
+    await engine2.mergeOnChainEvent(signerEvent);
+    await engine2.mergeOnChainEvent(storageEvent);
+    await engine2.mergeUserNameProof(fname);
 
-    // ...but we'll corrupt the sync trie by pretending that the signerAdd message is missing
-    syncEngine2.trie.deleteBySyncId(new SyncId(signerAdd));
+    await engine1.mergeMessage(castAdd);
+    await engine2.mergeMessage(castAdd);
 
-    // syncengine2 should be empty
-    expect(await syncEngine2.trie.items()).toEqual(0);
-    expect(await syncEngine2.trie.rootHash()).toEqual(EMPTY_HASH);
+    // ...but we'll corrupt the sync trie by pretending that the castAdd message, an onchain event and an fname are missing
+    await syncEngine2.trie.deleteBySyncId(SyncId.fromMessage(castAdd));
+    await syncEngine2.trie.deleteBySyncId(SyncId.fromOnChainEvent(storageEvent));
+    await syncEngine2.trie.deleteBySyncId(SyncId.fromFName(fname));
+
+    // syncengine2 should only have 2 onchain events
+    expect(await syncEngine2.trie.items()).toEqual(2);
 
     // Attempt to sync engine2 <-- engine1.
     // It will appear to engine2 that the message is missing, so it will request it from engine1.
@@ -507,7 +553,10 @@ describe("Multi peer sync engine", () => {
 
     // Since the message isn't actually missing, it should be a no-op, and the missing message should
     // get added back to the sync trie
-    sleepWhile(async () => (await syncEngine2.trie.exists(new SyncId(signerAdd))) === false, 1000);
+    await sleepWhile(
+      async () => (await syncEngine2.trie.exists(SyncId.fromMessage(castAdd))) === false,
+      SLEEPWHILE_TIMEOUT,
+    );
 
     // The root hashes should now be the same
     expect(await syncEngine1.trie.items()).toEqual(await syncEngine2.trie.items());
@@ -515,15 +564,16 @@ describe("Multi peer sync engine", () => {
   });
 
   test("syncEngine syncs with same numMessages but different hashes", async () => {
-    await engine1.mergeIdRegistryEvent(custodyEvent);
-    await engine1.mergeMessage(signerAdd);
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
+    await engine1.mergeOnChainEvent(storageEvent);
 
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-    const syncEngine2 = new SyncEngine(hub2, testDb2);
+    await engine2.mergeOnChainEvent(custodyEvent);
+    await engine2.mergeOnChainEvent(signerEvent);
+    await engine2.mergeOnChainEvent(storageEvent);
 
-    await engine2.mergeIdRegistryEvent(custodyEvent);
-    await engine2.mergeMessage(signerAdd);
+    const initialEngine1Count = await syncEngine1.trie.items();
+    const initialEngine2Count = await syncEngine2.trie.items();
 
     expect(await syncEngine1.trie.items()).toEqual(await syncEngine2.trie.items());
     expect(await syncEngine1.trie.rootHash()).toEqual(await syncEngine2.trie.rootHash());
@@ -532,14 +582,14 @@ describe("Multi peer sync engine", () => {
     await addMessagesWithTimeDelta(engine1, [167]);
     await addMessagesWithTimeDelta(engine2, [169]);
 
-    await sleepWhile(async () => (await syncEngine1.trie.items()) !== 2, 1000);
-    await sleepWhile(async () => (await syncEngine2.trie.items()) !== 2, 1000);
+    await sleepWhile(async () => (await syncEngine1.trie.items()) !== initialEngine1Count + 1, SLEEPWHILE_TIMEOUT);
+    await sleepWhile(async () => (await syncEngine2.trie.items()) !== initialEngine2Count + 1, SLEEPWHILE_TIMEOUT);
 
     // Do a sync
     await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
-    await sleepWhile(async () => (await syncEngine2.trie.items()) !== 3, 1000);
+    await sleepWhile(async () => (await syncEngine2.trie.items()) !== initialEngine2Count + 2, SLEEPWHILE_TIMEOUT);
 
-    expect(await syncEngine2.trie.items()).toEqual(3);
+    expect(await syncEngine2.trie.items()).toEqual(initialEngine2Count + 2);
 
     // Do a sync the other way
     {
@@ -548,7 +598,7 @@ describe("Multi peer sync engine", () => {
       const clientForServer2 = getInsecureHubRpcClient(`127.0.0.1:${port2}`);
 
       await syncEngine1.performSync("engine2", (await syncEngine2.getSnapshot())._unsafeUnwrap(), clientForServer2);
-      await sleepWhile(async () => (await syncEngine1.trie.items()) !== 3, 1000);
+      await sleepWhile(async () => (await syncEngine1.trie.items()) !== initialEngine2Count + 2, 1000);
 
       // Now both engines should have the same number of messages and the same root hash
       expect(await syncEngine1.trie.items()).toEqual(await syncEngine2.trie.items());
@@ -557,21 +607,16 @@ describe("Multi peer sync engine", () => {
       clientForServer2.$.close();
       await server2.stop();
     }
-
-    await syncEngine2.stop();
-    await engine2.stop();
   });
 
   test("syncEngine syncs with more numMessages and different hashes", async () => {
-    await engine1.mergeIdRegistryEvent(custodyEvent);
-    await engine1.mergeMessage(signerAdd);
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine1.mergeOnChainEvent(signerEvent);
+    await engine1.mergeOnChainEvent(storageEvent);
 
-    const engine2 = new Engine(testDb2, network);
-    const hub2 = new MockHub(testDb2, engine2);
-    const syncEngine2 = new SyncEngine(hub2, testDb2);
-
-    await engine2.mergeIdRegistryEvent(custodyEvent);
-    await engine2.mergeMessage(signerAdd);
+    await engine2.mergeOnChainEvent(custodyEvent);
+    await engine2.mergeOnChainEvent(signerEvent);
+    await engine2.mergeOnChainEvent(storageEvent);
 
     expect(await syncEngine1.trie.items()).toEqual(await syncEngine2.trie.items());
     expect(await syncEngine1.trie.rootHash()).toEqual(await syncEngine2.trie.rootHash());
@@ -580,14 +625,14 @@ describe("Multi peer sync engine", () => {
     await addMessagesWithTimeDelta(engine1, [167, 168]);
     await addMessagesWithTimeDelta(engine2, [169]);
 
-    await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
-    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, 1000);
+    await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
+    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
     // Do a sync
     await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
-    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, 1000);
+    await sleepWhile(() => syncEngine2.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
-    expect(await syncEngine2.trie.items()).toEqual(4);
+    expect(await syncEngine2.trie.items()).toEqual(6); // Includes on chain events
 
     // Do a sync the other way
     {
@@ -596,7 +641,7 @@ describe("Multi peer sync engine", () => {
       const clientForServer2 = getInsecureHubRpcClient(`127.0.0.1:${port2}`);
 
       await syncEngine1.performSync("engine2", (await syncEngine2.getSnapshot())._unsafeUnwrap(), clientForServer2);
-      await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
+      await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
 
       // Now both engines should have the same number of messages and the same root hash
       expect(await syncEngine1.trie.items()).toEqual(await syncEngine2.trie.items());
@@ -605,9 +650,6 @@ describe("Multi peer sync engine", () => {
       clientForServer2.$.close();
       await server2.stop();
     }
-
-    await syncEngine2.stop();
-    await engine2.stop();
   });
 
   xtest(
@@ -623,8 +665,9 @@ describe("Multi peer sync engine", () => {
       };
 
       // Add signer custody event to engine 1
-      await engine1.mergeIdRegistryEvent(custodyEvent);
-      await engine1.mergeMessage(signerAdd);
+      await engine1.mergeOnChainEvent(custodyEvent);
+      await engine1.mergeOnChainEvent(signerEvent);
+      await engine1.mergeOnChainEvent(storageEvent);
 
       // Add loads of messages to engine 1
       let msgTimestamp = 30662167;
@@ -656,13 +699,13 @@ describe("Multi peer sync engine", () => {
           }
           // console.log('adding batch', i, ' of ', numBatches);
           const addedMessages = await addMessagesWithTimeDelta(engine1, timestamps);
-          await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
+          await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
           castMessagesToRemove = addedMessages.slice(0, 10);
 
           msgTimestamp += batchSize;
           totalMessages += batchSize;
         }
-        await sleepWhile(() => syncEngine1.syncTrieQSize > 0, 1000);
+        await sleepWhile(() => syncEngine1.syncTrieQSize > 0, SLEEPWHILE_TIMEOUT);
       });
       expect(totalTime).toBeGreaterThan(0);
       expect(totalMessages).toBeGreaterThan(numBatches * batchSize);
@@ -671,7 +714,7 @@ describe("Multi peer sync engine", () => {
       const engine2 = new Engine(testDb2, network);
       const hub2 = new MockHub(testDb2, engine2);
       const syncEngine2 = new SyncEngine(hub2, testDb2);
-      syncEngine2.initialize();
+      syncEngine2.start();
 
       // Engine 2 should sync with engine1
       expect(
@@ -679,8 +722,9 @@ describe("Multi peer sync engine", () => {
           .shouldSync,
       ).toBeTruthy();
 
-      await engine2.mergeIdRegistryEvent(custodyEvent);
-      await engine2.mergeMessage(signerAdd);
+      await engine2.mergeOnChainEvent(custodyEvent);
+      await engine2.mergeOnChainEvent(signerEvent);
+      await engine2.mergeOnChainEvent(storageEvent);
 
       // Sync engine 2 with engine 1, and measure the time taken
       totalTime = await timedTest(async () => {
@@ -704,7 +748,7 @@ describe("Multi peer sync engine", () => {
       expect(await reinitSyncEngine.trie.rootHash()).toEqual("");
 
       totalTime = await timedTest(async () => {
-        await reinitSyncEngine.initialize();
+        await reinitSyncEngine.start();
       });
       // console.log('MerkleTrie total time', totalTime, 'seconds. Messages per second:', totalMessages / totalTime);
 
