@@ -1,6 +1,6 @@
 import {
   bytesToHexString,
-  ContactInfoContent,
+  ContactInfoContentBody,
   FidRequest,
   getFarcasterTime,
   HubAsyncResult,
@@ -71,7 +71,7 @@ interface SyncEvents {
 }
 
 type PeerContact = {
-  contactInfo: ContactInfoContent;
+  contactInfo: ContactInfoContentBody;
   peerId: PeerId;
 };
 
@@ -168,7 +168,7 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
   private _peerSyncSnapshot = new Map<string, TrieSnapshot>();
 
   // Peer Scoring
-  private _peerScorer = new PeerScorer();
+  private _peerScorer: PeerScorer;
 
   // Has the syncengine started yet?
   private _started = false;
@@ -185,6 +185,7 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     l2EventsProvider?: L2EventsProvider,
     fnameEventsProvider?: FNameRegistryEventsProvider,
     profileSync = false,
+    minSyncWindow?: number,
   ) {
     super();
 
@@ -200,6 +201,10 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     }
 
     this._hub = hub;
+    this._peerScorer = new PeerScorer({
+      onPeerScoreChanged: this._hub.updateApplicationPeerScore,
+      overrideBadSyncWindowThreshold: minSyncWindow,
+    });
 
     this._hub.engine.eventHandler.on("mergeMessage", async (event: MergeMessageHubEvent) => {
       const { message, deletedMessages } = event.mergeMessageBody;
@@ -329,7 +334,7 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     this._dbStats = await this.readDbStatsFromDb();
 
     this._started = true;
-    log.info({ rootHash }, "Sync engine initialized (eventsSync: true)");
+    log.info({ rootHash }, "Sync engine initialized");
   }
 
   /** Rebuild the entire Sync Trie */
@@ -394,8 +399,19 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     return this.currentHubPeerContacts.get(peerId);
   }
 
-  public addContactInfoForPeerId(peerId: PeerId, contactInfo: ContactInfoContent) {
-    this.currentHubPeerContacts.set(peerId.toString(), { peerId, contactInfo });
+  public addContactInfoForPeerId(peerId: PeerId, contactInfo: ContactInfoContentBody) {
+    const existingPeerInfo = this.getContactInfoForPeerId(peerId.toString());
+    if (existingPeerInfo) {
+      if (contactInfo.timestamp > existingPeerInfo.contactInfo.timestamp) {
+        log.info({ peerInfo: existingPeerInfo }, "Updating peer with latest contactInfo");
+        this.currentHubPeerContacts.set(peerId.toString(), { peerId, contactInfo });
+      }
+      return err(new HubError("bad_request.duplicate", "peer already exists"));
+    } else {
+      log.info({ peerInfo: contactInfo, connectedPeers: this.getPeerCount() }, "New Peer ContactInfo");
+      this.currentHubPeerContacts.set(peerId.toString(), { peerId, contactInfo });
+      return ok(undefined);
+    }
   }
 
   public removeContactInfoForPeerId(peerId: string) {

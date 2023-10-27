@@ -1,5 +1,21 @@
 # @farcaster/core
 
+## 0.13.0
+
+### Minor Changes
+
+- 3313c232: Adds support for contact info content signing + strictNoSign
+
+### Patch Changes
+
+- f3d32227: feat: Support v2 id and key registry contracts
+
+## 0.12.15
+
+### Patch Changes
+
+- 153da45a: Remove PubSub PeerDiscovery in favor of ContactInfo based PeerDiscovery
+
 ## 0.12.14
 
 ### Patch Changes
