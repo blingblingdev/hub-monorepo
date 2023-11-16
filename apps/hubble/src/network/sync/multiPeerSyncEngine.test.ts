@@ -22,6 +22,7 @@ import { MockHub } from "../../test/mocks.js";
 import { sleep, sleepWhile } from "../../utils/crypto.js";
 import { EMPTY_HASH } from "./trieNode.js";
 import { ensureMessageData } from "../../storage/db/message.js";
+import { bytesCompare } from "@farcaster/core";
 
 const TEST_TIMEOUT_SHORT = 10 * 1000;
 const TEST_TIMEOUT_LONG = 60 * 1000;
@@ -41,6 +42,7 @@ let signerEvent: OnChainEvent;
 let storageEvent: OnChainEvent;
 let castAdd: Message;
 let fname: UserNameProof;
+const blockNumber = 111888235; // Post v2 migration block
 
 const eventsByBlock = new Map<number, OnChainEvent>();
 // biome-ignore lint/suspicious/noExplicitAny: mock used only in tests
@@ -56,7 +58,7 @@ const retryTransferByName = fnameEventsProvider.retryTransferByName;
 beforeAll(async () => {
   const custodySignerKey = (await custodySigner.getSignerKey())._unsafeUnwrap();
   const signerKey = (await signer.getSignerKey())._unsafeUnwrap();
-  custodyEvent = Factories.IdRegistryOnChainEvent.build({ fid }, { transient: { to: custodySignerKey } });
+  custodyEvent = Factories.IdRegistryOnChainEvent.build({ fid, blockNumber }, { transient: { to: custodySignerKey } });
 
   signerEvent = Factories.SignerOnChainEvent.build(
     { fid, blockNumber: custodyEvent.blockNumber + 1 },
@@ -132,7 +134,7 @@ describe("Multi peer sync engine", () => {
     // Engine 1 is where we add events, and see if engine 2 will sync them
     engine1 = new Engine(testDb1, network);
     hub1 = new MockHub(testDb1, engine1);
-    syncEngine1 = new SyncEngine(hub1, testDb1);
+    syncEngine1 = new SyncEngine(hub1, testDb1, undefined, undefined, undefined, 0);
     await syncEngine1.start();
     server1 = new Server(hub1, engine1, syncEngine1);
     port1 = await server1.start();
@@ -152,7 +154,7 @@ describe("Multi peer sync engine", () => {
     });
     engine2 = new Engine(testDb2, network);
     hub2 = new MockHub(testDb2, engine2);
-    syncEngine2 = new SyncEngine(hub2, testDb2, l2EventsProvider, fnameEventsProvider);
+    syncEngine2 = new SyncEngine(hub2, testDb2, l2EventsProvider, fnameEventsProvider, undefined, 0);
   }, TEST_TIMEOUT_SHORT);
 
   afterEach(async () => {
@@ -464,7 +466,29 @@ describe("Multi peer sync engine", () => {
     expect(retryEventsMock).not.toHaveBeenCalled();
   });
 
-  test("recovers if there are missing messages in the engine", async () => {
+  test("local peer removes bad syncId entries from the sync trie", async () => {
+    await engine1.mergeOnChainEvent(custodyEvent);
+    await engine2.mergeOnChainEvent(custodyEvent);
+
+    const engine1Hash = await syncEngine1.trie.rootHash();
+    expect(engine1Hash).toEqual(await syncEngine2.trie.rootHash());
+    await syncEngine2.trie.insert(
+      SyncId.fromOnChainEvent(Factories.IdRegistryOnChainEvent.build({ blockNumber: custodyEvent.blockNumber + 1 })),
+    );
+    await syncEngine2.trie.insert(SyncId.fromMessage(castAdd));
+    // Insert the same name but for a different fid, and it should still be removed
+    await syncEngine2.trie.insert(SyncId.fromFName(Factories.UserNameProof.build({ name: fname.name, fid: fid + 1 })));
+
+    expect(engine1Hash).not.toEqual(await syncEngine2.trie.rootHash());
+    await syncEngine2.performSync("engine1", (await syncEngine1.getSnapshot())._unsafeUnwrap(), clientForServer1);
+
+    // Because do it without awaiting, we need to wait for the promise to resolve
+    await sleep(100);
+    expect(await syncEngine1.trie.items()).toEqual(await syncEngine2.trie.items());
+    expect(engine1Hash).toEqual(await syncEngine2.trie.rootHash());
+  });
+
+  test("remote peers recovers if there are missing data in the engine", async () => {
     // Add a message to engine1 synctrie, but not to the engine itself.
     await syncEngine1.trie.insert(SyncId.fromMessage(castAdd));
 

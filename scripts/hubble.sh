@@ -77,7 +77,13 @@ fetch_file_from_repo() {
 }
 
 # Upgrade the script
-self_upgrade() {    
+self_upgrade() {
+    # To allow easier testing
+    if key_exists "SKIP_SELF_UPGRADE"; then
+      echo "Skipping self upgrade"
+      return 1
+    fi
+
     local tmp_file
     tmp_file=$(mktemp)
     fetch_file_from_repo "$SCRIPT_FILE_PATH" "$tmp_file"
@@ -203,7 +209,7 @@ ensure_grafana() {
       mkdir -p grafana/data
       chmod 777 grafana/data
 
-      if $COMPOSE_CMD ps statsd 2>&1 >/dev/null; then
+      if $COMPOSE_CMD ps 2>&1 >/dev/null; then
           if $COMPOSE_CMD ps statsd | grep -q "Up"; then
               $COMPOSE_CMD restart statsd grafana
           else
@@ -315,6 +321,11 @@ install_docker() {
     # Install using Docker's convenience script
     curl -fsSL https://get.docker.com -o get-docker.sh
     sh get-docker.sh
+    if [[ $? -ne 0 ]]; then
+        echo "❌ Failed to install Docker via official script. Falling back to docker-compose."
+        curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        chmod +x /usr/local/bin/docker-compose
+    fi
     rm get-docker.sh
 
     # Add current user to the docker group
@@ -418,6 +429,12 @@ start_hubble() {
 
     # Start the "hubble" service
     $COMPOSE_CMD up -d hubble
+}
+
+cleanup() {
+  # Prune unused docker cruft. Make sure to call this only when hub is already running
+  echo "Pruning unused docker images and volumes"
+  docker system prune --volumes -f
 }
 
 set_compose_command() {
@@ -568,6 +585,10 @@ if [ "$1" == "autoupgrade" ]; then
 
     echo "$(date) Attempting hubble autoupgrade..."
 
+    # Since cronjob is running under root, make sure the dependencies are installed
+    install_jq
+    install_docker "$@"
+
     set_platform_commands
     set_compose_command
 
@@ -576,6 +597,9 @@ if [ "$1" == "autoupgrade" ]; then
     fetch_latest_docker_compose_and_dashboard
     ensure_grafana
     start_hubble
+    sleep 5
+    cleanup
+
     echo "$(date) Completed hubble autoupgrade"
 
     exit 0

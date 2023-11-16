@@ -1,5 +1,32 @@
 # @farcaster/hub-nodejs
 
+## 0.10.17
+
+### Patch Changes
+
+- 6890969b: fix: remove references to old contracts
+- Updated dependencies [5199f66e]
+- Updated dependencies [6890969b]
+- Updated dependencies [5199f66e]
+  - @farcaster/core@0.13.1
+
+## 0.10.16
+
+### Patch Changes
+
+- f3d32227: feat: Support v2 id and key registry contracts
+- Updated dependencies [3313c232]
+- Updated dependencies [f3d32227]
+  - @farcaster/core@0.13.0
+
+## 0.10.15
+
+### Patch Changes
+
+- 153da45a: Remove PubSub PeerDiscovery in favor of ContactInfo based PeerDiscovery
+- Updated dependencies [153da45a]
+  - @farcaster/core@0.12.15
+
 ## 0.10.14
 
 ### Patch Changes

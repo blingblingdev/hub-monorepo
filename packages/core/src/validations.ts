@@ -16,6 +16,8 @@ export const ALLOWED_CLOCK_SKEW_SECONDS = 10 * 60;
 export const FNAME_REGEX = /^[a-z0-9][a-z0-9-]{0,15}$/;
 export const HEX_REGEX = /^(0x)?[0-9A-Fa-f]+$/;
 
+export const USERNAME_MAX_LENGTH = 20;
+
 export const EMBEDS_V1_CUTOFF = 73612800; // 5/3/23 00:00 UTC
 
 /**
@@ -24,6 +26,7 @@ export const EMBEDS_V1_CUTOFF = 73612800; // 5/3/23 00:00 UTC
  */
 export type ValidationMethods = {
   ed25519_verify: (signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array) => Promise<boolean>;
+  ed25519_signMessageHash: (hash: Uint8Array, signingKey: Uint8Array) => Promise<Uint8Array>;
   blake3_20: (message: Uint8Array) => Uint8Array;
 };
 
@@ -33,7 +36,62 @@ export type ValidationMethods = {
 const pureJSValidationMethods: ValidationMethods = {
   ed25519_verify: async (s: Uint8Array, m: Uint8Array, p: Uint8Array) =>
     (await ed25519.verifyMessageHashSignature(s, m, p)).unwrapOr(false),
+  ed25519_signMessageHash: async (h: Uint8Array, s: Uint8Array) =>
+    (await ed25519.signMessageHash(h, s)).unwrapOr(new Uint8Array([])),
   blake3_20: (message: Uint8Array) => blake3(message, { dkLen: 20 }),
+};
+
+export const createMessageHash = async (
+  message?: Uint8Array,
+  hashScheme?: protobufs.HashScheme,
+  validationMethods: ValidationMethods = pureJSValidationMethods,
+): HubAsyncResult<Uint8Array> => {
+  if (!message || message.length === 0) {
+    return err(new HubError("bad_request.validation_failure", "hash is missing"));
+  }
+
+  if (hashScheme !== protobufs.HashScheme.BLAKE3) {
+    return err(new HubError("bad_request.validation_failure", "unsupported hash scheme"));
+  }
+
+  return ok(validationMethods.blake3_20(message));
+};
+
+export const signMessageHash = async (
+  hash?: Uint8Array,
+  signingKey?: Uint8Array,
+  validationMethods: ValidationMethods = pureJSValidationMethods,
+): HubAsyncResult<Uint8Array> => {
+  if (!hash || hash.length === 0) {
+    return err(new HubError("bad_request.validation_failure", "hash is missing"));
+  }
+
+  if (!signingKey || signingKey.length !== 64) {
+    return err(new HubError("bad_request.validation_failure", "signingKey is invalid"));
+  }
+
+  return ok(await validationMethods.ed25519_signMessageHash(hash, signingKey));
+};
+
+export const verifySignedMessageHash = async (
+  hash?: Uint8Array,
+  signature?: Uint8Array,
+  signer?: Uint8Array,
+  validationMethods: ValidationMethods = pureJSValidationMethods,
+): HubAsyncResult<boolean> => {
+  if (!hash || hash.length === 0) {
+    return err(new HubError("bad_request.validation_failure", "hash is missing"));
+  }
+
+  if (!signature || signature.length !== 64) {
+    return err(new HubError("bad_request.validation_failure", "signature is invalid"));
+  }
+
+  if (!signer || signer.length !== 32) {
+    return err(new HubError("bad_request.validation_failure", "signer is invalid"));
+  }
+
+  return ok(await validationMethods.ed25519_verify(signature, hash, signer));
 };
 
 export const validateMessageHash = (hash?: Uint8Array): HubResult<Uint8Array> => {
@@ -382,6 +440,15 @@ export const validateCastAddBody = (
     return err(new HubError("bad_request.validation_failure", "cannot use both embeds and string embeds"));
   }
 
+  if (
+    body.text.length === 0 &&
+    body.embeds.length === 0 &&
+    body.embedsDeprecated.length === 0 &&
+    body.mentions.length === 0
+  ) {
+    return err(new HubError("bad_request.validation_failure", "cast is empty"));
+  }
+
   for (let i = 0; i < body.embeds.length; i++) {
     const embed = body.embeds[i];
 
@@ -673,6 +740,7 @@ export const validateFname = <T extends string | Uint8Array>(fnameP?: T | null):
     return err(new HubError("bad_request.validation_failure", "fname is missing"));
   }
 
+  // FNAME_MAX_LENGTH - ".eth".length
   if (fname.length > 16) {
     return err(new HubError("bad_request.validation_failure", `fname "${fname}" > 16 characters`));
   }
@@ -720,7 +788,7 @@ export const validateEnsName = <T extends string | Uint8Array>(ensNameP?: T | nu
     return err(new HubError("bad_request.validation_failure", `ensName "${ensName}" unsupported subdomain`));
   }
 
-  if (ensName.length > 20) {
+  if (ensName.length > USERNAME_MAX_LENGTH) {
     return err(new HubError("bad_request.validation_failure", `ensName "${ensName}" > 20 characters`));
   }
 

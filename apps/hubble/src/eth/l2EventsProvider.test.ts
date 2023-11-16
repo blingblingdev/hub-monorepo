@@ -18,16 +18,16 @@ const onChainEventStore = new OnChainEventStore(db, new StoreEventHandler(db));
 
 let l2EventsProvider: L2EventsProvider;
 let storageRegistryAddress: `0x${string}`;
-let keyRegistryAddress: `0x${string}`;
-let idRegistryAddress: `0x${string}`;
+let keyRegistryV2Address: `0x${string}`;
+let idRegistryV2Address: `0x${string}`;
 
 const TEST_TIMEOUT_LONG = 30 * 1000; // 30s timeout
 
 beforeAll(() => {
   // Poll aggressively for fast testing
   storageRegistryAddress = bytesToHexString(Factories.EthAddress.build())._unsafeUnwrap();
-  idRegistryAddress = bytesToHexString(Factories.EthAddress.build())._unsafeUnwrap();
-  keyRegistryAddress = bytesToHexString(Factories.EthAddress.build())._unsafeUnwrap();
+  idRegistryV2Address = bytesToHexString(Factories.EthAddress.build())._unsafeUnwrap();
+  keyRegistryV2Address = bytesToHexString(Factories.EthAddress.build())._unsafeUnwrap();
   L2EventsProvider.blockPollingInterval = 10;
   L2EventsProvider.eventPollingInterval = 10;
 });
@@ -43,8 +43,8 @@ describe("build", () => {
       "http://some-url",
       false,
       storageRegistryAddress,
-      keyRegistryAddress,
-      idRegistryAddress,
+      keyRegistryV2Address,
+      idRegistryV2Address,
       1,
       10000,
       OptimismConstants.ChainId,
@@ -63,8 +63,8 @@ describe("build", () => {
       "http://some-url,http://some-other-url",
       false,
       storageRegistryAddress,
-      keyRegistryAddress,
-      idRegistryAddress,
+      keyRegistryV2Address,
+      idRegistryV2Address,
       1,
       10000,
       OptimismConstants.ChainId,
@@ -88,8 +88,8 @@ describe("process events", () => {
       hub,
       publicClient,
       storageRegistryAddress,
-      keyRegistryAddress,
-      idRegistryAddress,
+      keyRegistryV2Address,
+      idRegistryV2Address,
       1,
       10000,
       OptimismConstants.ChainId,
