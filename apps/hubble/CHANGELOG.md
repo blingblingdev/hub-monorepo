@@ -1,5 +1,32 @@
 # @farcaster/hubble
 
+## 1.8.0
+
+### Minor Changes
+
+- Expiry date changed to 1/10/24 0:00:00 UTC
+
+### Patch Changes
+
+- 6bfb694b: fix: Handle docker-compose versions in hubble.sh
+
+## 1.7.2
+
+### Patch Changes
+
+- 912f680f: fix: catch and ignore provider errors during retry
+
+## 1.7.1
+
+### Patch Changes
+
+- 5199f66e: fix: disallow empty casts
+- 6890969b: fix: remove references to old contracts
+- 5199f66e: fix: Allow syncTrie to handle names that are substrings
+- 5199f66e: fix: Fix peer check job not actually starting
+- Updated dependencies [6890969b]
+  - @farcaster/hub-nodejs@0.10.17
+
 ## 1.7.0
 
 ### Minor Changes

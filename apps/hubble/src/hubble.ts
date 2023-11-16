@@ -66,7 +66,11 @@ import { CheckIncomingPortsJobScheduler } from "./storage/jobs/checkIncomingPort
 import { NetworkConfig, applyNetworkConfig, fetchNetworkConfig } from "./network/utils/networkConfig.js";
 import { UpdateNetworkConfigJobScheduler } from "./storage/jobs/updateNetworkConfigJob.js";
 import { statsd } from "./utils/statsd.js";
-import { LATEST_DB_SCHEMA_VERSION, performDbMigrations } from "./storage/db/migrations/migrations.js";
+import {
+  getDbSchemaVersion,
+  LATEST_DB_SCHEMA_VERSION,
+  performDbMigrations,
+} from "./storage/db/migrations/migrations.js";
 import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
 import path from "path";
 import { addProgressBar } from "./utils/progressBars.js";
@@ -86,7 +90,7 @@ export const APP_NICKNAME = process.env["HUBBLE_NAME"] ?? "Farcaster Hub";
 export const SNAPSHOT_S3_DEFAULT_BUCKET = "download.farcaster.xyz";
 export const S3_REGION = "us-east-1";
 
-export const FARCASTER_VERSION = "2023.10.4";
+export const FARCASTER_VERSION = "2023.11.15";
 export const FARCASTER_VERSIONS_SCHEDULE: VersionSchedule[] = [
   { version: "2023.3.1", expiresAt: 1682553600000 }, // expires at 4/27/23 00:00 UTC
   { version: "2023.4.19", expiresAt: 1686700800000 }, // expires at 6/14/23 00:00 UTC
@@ -94,6 +98,7 @@ export const FARCASTER_VERSIONS_SCHEDULE: VersionSchedule[] = [
   { version: "2023.7.12", expiresAt: 1693958400000 }, // expires at 9/6/23 00:00 UTC
   { version: "2023.8.23", expiresAt: 1697587200000 }, // expires at 10/18/23 00:00 UTC
   { version: "2023.10.4", expiresAt: 1701216000000 }, // expires at 11/28/23 00:00 UTC
+  { version: "2023.11.15", expiresAt: 1704844800000 }, // expires at 1/10/23 00:00 UTC
 ];
 
 const MAX_CONTACT_INFO_AGE_MS = GOSSIP_SEEN_TTL;
@@ -340,10 +345,8 @@ export class Hub implements HubInterface {
         options.l2RpcUrl,
         options.rankRpcs ?? false,
         options.l2StorageRegistryAddress ?? OptimismConstants.StorageRegistryAddress,
-        options.l2KeyRegistryAddress ?? OptimismConstants.KeyRegistryAddress,
-        options.l2IdRegistryAddress ?? OptimismConstants.IdRegistryAddress,
-        options.l2KeyRegistryV2Address,
-        options.l2IdRegistryV2Address,
+        options.l2KeyRegistryV2Address ?? OptimismConstants.KeyRegistryV2Address,
+        options.l2IdRegistryV2Address ?? OptimismConstants.IdRegistryV2Address,
         options.l2FirstBlock ?? OptimismConstants.FirstBlock,
         options.l2ChunkSize ?? OptimismConstants.ChunkSize,
         options.l2ChainId ?? OptimismConstants.ChainId,
@@ -614,7 +617,7 @@ export class Hub implements HubInterface {
     );
 
     // Get the DB Schema version
-    const dbSchemaVersion = await this.getDbSchemaVersion();
+    const dbSchemaVersion = await getDbSchemaVersion(this.rocksDB);
     if (dbSchemaVersion > LATEST_DB_SCHEMA_VERSION) {
       throw new HubError(
         "unavailable.storage_failure",
@@ -627,7 +630,6 @@ export class Hub implements HubInterface {
       const success = await performDbMigrations(this.rocksDB, dbSchemaVersion);
       if (success) {
         log.info({}, "All DB migrations successful");
-        await this.setDbSchemaVersion(LATEST_DB_SCHEMA_VERSION);
       } else {
         throw new HubError("unavailable.storage_failure", "DB migrations failed");
       }
@@ -746,10 +748,6 @@ export class Hub implements HubInterface {
       this.strictContactInfoValidation = !!strictContactInfoValidation;
       const shouldRestart = this.strictNoSign !== !!strictNoSign;
       this.strictNoSign = !!strictNoSign;
-
-      if (networkConfig.idRegistryV2Address && networkConfig.keyRegistryV2Address) {
-        this.l2RegistryProvider.setV2Addresses(networkConfig.keyRegistryV2Address, networkConfig.idRegistryV2Address);
-      }
 
       log.info({ allowedPeerIds, deniedPeerIds, allowlistedImmunePeers }, "Network config applied");
 
@@ -1453,33 +1451,6 @@ export class Hub implements HubInterface {
 
     // get the enum value from the number
     return networkNumber.map((n) => n as FarcasterNetwork);
-  }
-
-  async getDbSchemaVersion(): Promise<number> {
-    const dbResult = await ResultAsync.fromPromise(
-      this.rocksDB.get(Buffer.from([RootPrefix.DBSchemaVersion])),
-      (e) => e as HubError,
-    );
-    if (dbResult.isErr()) {
-      return 0;
-    }
-
-    // parse the buffer as an int
-    const schemaVersion = Result.fromThrowable(
-      () => dbResult.value.readUInt32BE(0),
-      (e) => e as HubError,
-    )();
-
-    return schemaVersion.unwrapOr(0);
-  }
-
-  async setDbSchemaVersion(version: number): HubAsyncResult<void> {
-    const txn = this.rocksDB.transaction();
-    const value = Buffer.alloc(4);
-    value.writeUInt32BE(version, 0);
-    txn.put(Buffer.from([RootPrefix.DBSchemaVersion]), value);
-
-    return ResultAsync.fromPromise(this.rocksDB.commit(txn), (e) => e as HubError);
   }
 
   async setDbNetwork(network: FarcasterNetwork): HubAsyncResult<void> {
