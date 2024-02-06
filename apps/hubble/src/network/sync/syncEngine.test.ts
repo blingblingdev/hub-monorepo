@@ -20,7 +20,7 @@ import SyncEngine from "./syncEngine.js";
 import { SyncId } from "./syncId.js";
 import { jestRocksDB } from "../../storage/db/jestUtils.js";
 import Engine from "../../storage/engine/index.js";
-import { sleep, sleepWhile } from "../../utils/crypto.js";
+import { sleepWhile } from "../../utils/crypto.js";
 import { NetworkFactories } from "../../network/utils/factories.js";
 import { HubInterface } from "../../hubble.js";
 import { MockHub } from "../../test/mocks.js";
@@ -560,6 +560,19 @@ describe("SyncEngine", () => {
         await engine.mergeUserNameProof(userNameProof);
         expect(await syncEngine.trie.exists(SyncId.fromFName(userNameProof))).toBeTruthy();
         expect((await syncEngine.getDbStats()).numFnames).toEqual(1);
+      });
+      test("does not add a deleted fname to the trie", async () => {
+        await engine.mergeUserNameProof(userNameProof);
+        const deletionProof = Factories.UserNameProof.build({
+          type: UserNameType.USERNAME_TYPE_FNAME,
+          name: userNameProof.name,
+          timestamp: userNameProof.timestamp + 10,
+          fid: 0,
+        });
+        await engine.mergeUserNameProof(userNameProof);
+        await engine.mergeUserNameProof(deletionProof);
+        expect(await syncEngine.trie.exists(SyncId.fromFName(userNameProof))).toBeFalsy();
+        expect((await syncEngine.getDbStats()).numFnames).toEqual(0);
       });
       test("removes deleted fname proofs", async () => {
         const supercedingUserNameProof = Factories.UserNameProof.build({
