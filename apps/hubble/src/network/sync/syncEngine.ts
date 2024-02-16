@@ -65,7 +65,7 @@ import { getUserNameProof } from "../../storage/db/nameRegistryEvent.js";
 // attempt to sync messages that are older than this time.
 const SYNC_THRESHOLD_IN_SECONDS = 10;
 const HASHES_PER_FETCH = 128;
-const SYNC_MAX_DURATION = 30 * 60 * 1000; // 30 minutes
+const SYNC_MAX_DURATION = 110 * 60 * 1000; // 110 minutes, just slightly less than the periodic sync job frequency
 // 4x the number of CPUs, clamped between 2 and 16
 const SYNC_PARALLELISM = Math.max(Math.min(os.cpus().length * 4, 16), 2);
 const SYNC_INTERRUPT_TIMEOUT = 30 * 1000; // 30 seconds
@@ -427,15 +427,27 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
     const existingPeerInfo = this.getContactInfoForPeerId(peerId.toString());
     if (existingPeerInfo) {
       if (contactInfo.timestamp > existingPeerInfo.contactInfo.timestamp) {
-        log.debug({ peerInfo: existingPeerInfo }, "Updating peer with latest contactInfo");
         this.currentHubPeerContacts.set(peerId.toString(), { peerId, contactInfo });
       }
       return err(new HubError("bad_request.duplicate", "peer already exists"));
     } else {
-      log.info({ peerInfo: contactInfo, connectedPeers: this.getPeerCount() }, "New Peer ContactInfo");
       this.currentHubPeerContacts.set(peerId.toString(), { peerId, contactInfo });
-      return ok(undefined);
     }
+    log.info(
+      {
+        peerInfo: contactInfo,
+        theirMessages: contactInfo.count,
+        peerNetwork: contactInfo.network,
+        peerVersion: contactInfo.hubVersion,
+        peerAppVersion: contactInfo.appVersion,
+        connectedPeers: this.getPeerCount(),
+        peerId: peerId.toString(),
+        isNew: !!existingPeerInfo,
+        gossipDelay: (Date.now() - contactInfo.timestamp) / 1000,
+      },
+      "Updated Peer ContactInfo",
+    );
+    return ok(undefined);
   }
 
   public removeContactInfoForPeerId(peerId: string) {
@@ -481,14 +493,32 @@ class SyncEngine extends TypedEmitter<SyncEvents> {
 
     // If we don't have a peer contact, get a random one from the current list
     if (!peerContact) {
-      // Pick a random key
-      const randomPeer = Array.from(this.currentHubPeerContacts.keys())[
-        Math.floor(Math.random() * this.currentHubPeerContacts.size)
-      ] as string;
+      let peers: PeerContact[] = [];
 
-      const c = this.currentHubPeerContacts.get(randomPeer);
-      peerContact = c?.contactInfo;
-      peerId = c?.peerId;
+      // Prefer hubs that have more messages than us, if no such hub is available, pick a random one
+      const snapshotResult = await this.getSnapshot();
+      if (snapshotResult.isOk()) {
+        // Use a buffer of 5% of our messages so the peer with the highest message count does not get picked
+        // disproportionately
+        const messageThreshold = snapshotResult.value.numMessages * 0.95;
+        peers = Array.from(this.currentHubPeerContacts.values()).filter((p) => p.contactInfo.count > messageThreshold);
+      }
+
+      if (peers.length === 0) {
+        peers = Array.from(this.currentHubPeerContacts.values());
+        log.info(
+          { peersCount: this.currentHubPeerContacts.size, eligiblePeers: peers.length },
+          `Diffsync: Choosing random peer among ${peers.length} peers with fewer messages`,
+        );
+      } else {
+        log.info(
+          { peersCount: this.currentHubPeerContacts.size, eligiblePeers: peers.length },
+          `Diffsync: Choosing random peer among ${peers.length} peers with more messages`,
+        );
+      }
+      const randomPeer = peers[Math.floor(Math.random() * peers.length)];
+      peerContact = randomPeer?.contactInfo;
+      peerId = randomPeer?.peerId;
     }
 
     // If we still don't have a peer, skip the sync
