@@ -2,4 +2,4 @@
 "@farcaster/hubble": patch
 ---
 
-chore: log gossip message delay
+Run via pm2 process supervisor
