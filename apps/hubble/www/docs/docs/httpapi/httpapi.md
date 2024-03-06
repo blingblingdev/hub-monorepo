@@ -27,7 +27,7 @@ try {
     const response = await axios.get(`${server}/v1/castsByFid?fid=${fid}`);
 
     console.log(`API Returned HTTP status ${response.status}`);    
-    console.log(`First Cast's text is ${response.messages[0].data.castAddBody.text}`);
+    console.log(`First Cast's text is ${response.data.messages[0].data.castAddBody.text}`);
 } catch (e) {
     // Handle errors
     console.log(response);
@@ -58,6 +58,8 @@ Most endpoints support paging to get a large number of responses.
 The returned `nextPageToken` is empty if there are no more pages to return. 
 
 Pagination query parameters can be combined with other query parameters supported by the endpoint. For example, `/v1/casts?fid=2&pageSize=3`.
+
+All endpoints have a maximum page size of `1000`.
 
 **Example**
 

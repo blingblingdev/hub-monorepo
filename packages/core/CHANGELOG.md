@@ -1,5 +1,37 @@
 # @farcaster/core
 
+## 0.14.6
+
+### Patch Changes
+
+- f7d13376: Fix unicode error for replicator, add constraint where verification message claim signatures must be hex
+
+## 0.14.5
+
+### Patch Changes
+
+- 5a1764d8: perf: Move DB and Reactions store to rust
+
+## 0.14.4
+
+### Patch Changes
+
+- 579d29a4: feat: add transaction ID to frame message
+- 419d8287: Add currentPeers RPC endpoint
+
+## 0.14.3
+
+### Patch Changes
+
+- 1fd0f686: fix: add bs58 dependency
+
+## 0.14.2
+
+### Patch Changes
+
+- 5703d339: feat: add state field to frame message
+- 136ef6b4: fix: Remove old dependencies
+
 ## 0.14.1
 
 ### Patch Changes

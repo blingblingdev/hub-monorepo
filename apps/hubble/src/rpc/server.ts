@@ -2,6 +2,7 @@ import {
   CastAddMessage,
   CastId,
   CastRemoveMessage,
+  ContactInfoResponse,
   DbStats,
   FidsResponse,
   getServer,
@@ -66,7 +67,7 @@ export const DEFAULT_SUBSCRIBE_GLOBAL_LIMIT = 4096; // Max 4096 subscriptions gl
 
 export type RpcUsers = Map<string, string[]>;
 
-const log = logger.child({ component: "rpcServer" });
+const log = logger.child({ component: "gRPCServer" });
 
 // Check if the user is authenticated via the metadata
 export const authenticateUser = (metadata: Metadata, rpcUsers: RpcUsers): HubResult<boolean> => {
@@ -305,15 +306,15 @@ export default class Server {
     return new Promise((resolve, reject) => {
       if (force) {
         this.grpcServer.forceShutdown();
-        log.info("Force shutdown succeeded");
+        log.info("gRPC server force shutdown succeeded");
         resolve();
       } else {
         this.grpcServer.tryShutdown((err) => {
           if (err) {
-            log.error(`Shutdown failed: ${err}`);
+            log.error(`gRPC server shutdown failed: ${err}`);
             reject(err);
           } else {
-            log.info("Shutdown succeeded");
+            log.info("gRPC server shutdown succeeded");
             resolve();
           }
         });
@@ -377,6 +378,25 @@ export default class Server {
           callback(null, info);
         })();
       },
+      getCurrentPeers: (call, callback) => {
+        (async () => {
+          const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
+          log.debug({ method: "getCurrentPeers", req: call.request }, `RPC call from ${peer}`);
+
+          (async () => {
+            const currentHubPeerContacts = this.syncEngine?.getCurrentHubPeerContacts();
+
+            if (!currentHubPeerContacts) {
+              callback(null, ContactInfoResponse.create({ contacts: [] }));
+              return;
+            }
+
+            const contactInfoArray = Array.from(currentHubPeerContacts).map((peerContact) => peerContact.contactInfo);
+            callback(null, ContactInfoResponse.create({ contacts: contactInfoArray }));
+          })();
+        })();
+      },
+
       getSyncStatus: (call, callback) => {
         (async () => {
           const peer = Result.fromThrowable(() => call.getPeer())().unwrapOr("unknown");
@@ -1142,7 +1162,12 @@ export default class Server {
         const bufferedStreamWriter = new BufferedStreamWriter(stream);
 
         // We'll listen to all events and write them to the stream as they happen
+        let lastEventId = 0;
         const eventListener = (event: HubEvent) => {
+          if (event.id <= lastEventId) {
+            log.warn({ event, lastEventId }, "subscribe: Out-of-order event sent on subscribe()");
+          }
+          lastEventId = event.id;
           bufferedStreamWriter.writeToStream(event);
         };
 
@@ -1187,46 +1212,42 @@ export default class Server {
           const rssUsage = process.memoryUsage().rss;
           const RSS_USAGE_THRESHOLD = 1_000_000_000; // 1G
 
-          await this.engine.getDb().forEachIterator(
-            async (_key, value) => {
-              const event = HubEvent.decode(Uint8Array.from(value as Buffer));
-              if (request.eventTypes.length === 0 || request.eventTypes.includes(event.type)) {
-                const writeResult = bufferedStreamWriter.writeToStream(event);
+          await this.engine.getDb().forEachIteratorByOpts(eventsIteratorOpts.value, async (_key, value) => {
+            const event = HubEvent.decode(Uint8Array.from(value as Buffer));
+            if (request.eventTypes.length === 0 || request.eventTypes.includes(event.type)) {
+              const writeResult = bufferedStreamWriter.writeToStream(event);
 
-                if (writeResult.isErr()) {
-                  logger.warn(
-                    { err: writeResult.error },
-                    `subscribe: failed to write to stream while returning events ${request.fromId}`,
-                  );
+              if (writeResult.isErr()) {
+                logger.warn(
+                  { err: writeResult.error },
+                  `subscribe: failed to write to stream while returning events ${request.fromId}`,
+                );
+
+                return true;
+              } else {
+                if (writeResult.value === false) {
+                  // If the stream was buffered, we can wait for a bit before continuing
+                  // to allow the client to read the data. If this happens too much, the bufferedStreamWriter
+                  // will timeout and destroy the stream.
+                  // The buffered writer is not async to make it easier to preserve ordering guarantees. So, we sleep here
+                  await sleep(SLOW_CLIENT_GRACE_PERIOD_MS / STREAM_MESSAGE_BUFFER_SIZE);
+                }
+
+                // Write was successful, check the RSS usage
+                if (process.memoryUsage().rss > rssUsage + RSS_USAGE_THRESHOLD) {
+                  // more than 1G, so we're writing a lot of data to the stream, but the client is not reading it.
+                  // We'll destroy the stream.
+                  const error = new HubError("unavailable.network_failure", "stream memory usage too much");
+                  logger.error({ errCode: error.errCode }, error.message);
+                  stream.destroy(error);
 
                   return true;
-                } else {
-                  if (writeResult.value === false) {
-                    // If the stream was buffered, we can wait for a bit before continuing
-                    // to allow the client to read the data. If this happens too much, the bufferedStreamWriter
-                    // will timeout and destroy the stream.
-                    // The buffered writer is not async to make it easier to preserve ordering guarantees. So, we sleep here
-                    await sleep(SLOW_CLIENT_GRACE_PERIOD_MS / STREAM_MESSAGE_BUFFER_SIZE);
-                  }
-
-                  // Write was successful, check the RSS usage
-                  if (process.memoryUsage().rss > rssUsage + RSS_USAGE_THRESHOLD) {
-                    // more than 1G, so we're writing a lot of data to the stream, but the client is not reading it.
-                    // We'll destroy the stream.
-                    const error = new HubError("unavailable.network_failure", "stream memory usage too much");
-                    logger.error({ errCode: error.errCode }, error.message);
-                    stream.destroy(error);
-
-                    return true;
-                  }
                 }
               }
+            }
 
-              return false;
-            },
-            eventsIteratorOpts.value,
-            HUBEVENTS_READER_TIMEOUT,
-          );
+            return false;
+          });
 
           // If we reach here, the iterator has ended, so we'll clear the timeout
           clearTimeout(timeout);

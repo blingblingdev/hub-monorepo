@@ -5,9 +5,7 @@
 ############## Stage 1: Create pruned version of monorepo #####################
 ###############################################################################
 
-FROM node:20.2-alpine AS prune
-
-RUN apk add --no-cache libc6-compat
+FROM node:21.6-slim AS prune
 
 USER node
 RUN mkdir /home/node/app
@@ -23,10 +21,10 @@ RUN /home/node/.yarn/bin/turbo prune --scope=@farcaster/hubble --docker
 ############## Stage 2: Build the code using a full node image ################
 ###############################################################################
 
-FROM node:20.2-alpine AS build
+FROM node:21.6-slim AS build
 
 # Needed for compilation step
-RUN apk add --no-cache libc6-compat python3 make g++ linux-headers curl
+RUN apt-get update && apt-get install -y python3 make g++ linux-headers-generic curl protobuf-compiler libclang-dev
 
 USER node
 RUN mkdir /home/node/app
@@ -49,6 +47,7 @@ RUN yarn install --frozen-lockfile --network-timeout 1800000
 COPY --chown=node:node --from=prune /home/node/app/out/full/ .
 # turbo prune doesn't include global tsconfig.json (https://github.com/vercel/turbo/issues/2177)
 COPY --chown=node:node tsconfig.json tsconfig.json
+COPY --chown=node:node protobufs protobufs
 
 # Build code
 RUN yarn build
@@ -60,10 +59,7 @@ RUN rm -rf node_modules && yarn install --production --ignore-scripts --prefer-o
 ########## Stage 3: Copy over the built code to a leaner alpine image #########
 ###############################################################################
 
-FROM node:20.2-alpine as app
-
-# Requirement for runtime metrics integrations
-RUN apk add libc6-compat
+FROM node:21.6-slim as app
 
 # Set non-root user and expose ports
 USER node
@@ -81,6 +77,7 @@ COPY --chown=node:node --from=build /home/node/app/apps/hubble/build ./apps/hubb
 COPY --chown=node:node --from=build /home/node/app/node_modules ./node_modules
 COPY --chown=node:node --from=build /home/node/app/packages/core/dist ./packages/core/dist/
 COPY --chown=node:node --from=build /home/node/app/packages/hub-nodejs/dist ./packages/hub-nodejs/dist/
+
 
 # BuildKit doesn't support --squash flag, so emulate by copying into fewer layers
 FROM scratch

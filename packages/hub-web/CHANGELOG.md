@@ -1,5 +1,38 @@
 # @farcaster/hub-web
 
+## 0.8.4
+
+### Patch Changes
+
+- 5a1764d8: perf: Move DB and Reactions store to rust
+- Updated dependencies [5a1764d8]
+  - @farcaster/core@0.14.5
+
+## 0.8.3
+
+### Patch Changes
+
+- 579d29a4: feat: add transaction ID to frame message
+- 419d8287: Add currentPeers RPC endpoint
+- Updated dependencies [579d29a4]
+- Updated dependencies [419d8287]
+  - @farcaster/core@0.14.4
+
+## 0.8.2
+
+### Patch Changes
+
+- update @farcaster/core
+
+## 0.8.1
+
+### Patch Changes
+
+- 5703d339: feat: add state field to frame message
+- Updated dependencies [5703d339]
+- Updated dependencies [136ef6b4]
+  - @farcaster/core@0.14.2
+
 ## 0.8.0
 
 ### Minor Changes

@@ -1,4 +1,5 @@
 import {
+  ContactInfoResponse,
   FidsResponse,
   HubError,
   HubEvent,
@@ -54,6 +55,8 @@ type FirstTemplateParamType<M extends keyof HubServiceServer> = FirstGenericType
 type StaticEncodable<T> = {
   toJSON(message: T): unknown;
 };
+
+export const DEFAULT_PAGE_SIZE = 1000; // Global maximum limit
 
 // Get the call Object for a given method
 function getCallObject<M extends keyof HubServiceServer>(
@@ -190,17 +193,19 @@ type QueryPageParams = {
   pageToken?: string;
   reverse?: number | boolean;
 };
+
 function getPageOptions(query: QueryPageParams): PageOptions {
-  // When passing in a page token, it's base64 encoded, so we need to decode it
-  // however, the '+' character is not valid in a url, so it gets replaced with a space
-  // and the base64 decoder doesn't like that, so we need to replace it with a '+' again
-  // before decoding
+  const pageSize = query.pageSize ? parseInt(query.pageSize.toString()) : DEFAULT_PAGE_SIZE;
+
+  // Ensure the pageSize does not exceed the global maximum
+  const effectivePageSize = Math.min(pageSize, DEFAULT_PAGE_SIZE);
+
   const pageToken = query.pageToken
     ? Uint8Array.from(Buffer.from(query.pageToken.replaceAll(" ", "+"), "base64"))
     : undefined;
 
   return {
-    pageSize: query.pageSize ? parseInt(query.pageSize.toString()) : undefined,
+    pageSize: effectivePageSize,
     pageToken,
     reverse: query.reverse ? true : undefined,
   };
@@ -248,6 +253,13 @@ export class HttpAPIServer {
 
       const call = getCallObject("getInfo", { dbStats }, request);
       this.grpcImpl.getInfo(call, handleResponse(reply, HubInfoResponse));
+    });
+
+    //================currentPeers================
+    // @doc-tag: /currentPeers
+    this.app.get("/v1/currentPeers", (request, reply) => {
+      const call = getCallObject("getCurrentPeers", {}, request);
+      this.grpcImpl.getCurrentPeers(call, handleResponse(reply, ContactInfoResponse));
     });
 
     //================Casts================

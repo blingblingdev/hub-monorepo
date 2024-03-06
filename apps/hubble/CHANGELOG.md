@@ -1,5 +1,62 @@
 # @farcaster/hubble
 
+## 1.10.9
+
+### Patch Changes
+
+- 4a0fa6f4: fix: Handle latestBlock properly when sending to API
+- 48d49b2e: fix: Simplify github actions test runs
+- b302d3f4: fix: Add approximate_size for DB
+- 6d765651: fix: hub crash on contract events
+
+## 1.10.8
+
+### Patch Changes
+
+- ff1eefbe: fix: Fix bad version release because of package.json
+
+## 1.10.7
+
+### Patch Changes
+
+- 5a1764d8: perf: Move DB and Reactions store to rust
+- ac861b12: fix: Log directly from worker threads
+- Updated dependencies [5a1764d8]
+  - @farcaster/hub-nodejs@0.11.5
+
+## 1.10.6
+
+### Patch Changes
+
+- 361996cf: fix: Update neynar bootstrap hub
+- 419d8287: Add currentPeers RPC endpoint
+- c4305b3e: fix: Use UTC for jobs scheduler
+- Updated dependencies [579d29a4]
+- Updated dependencies [419d8287]
+  - @farcaster/hub-nodejs@0.11.4
+
+## 1.10.5
+
+### Patch Changes
+
+- 72bbf29c: fix: Set dial timeout when connecting to peers for gossip node (default: 2 seconds) and expose LIBP2P_CONNECT_TIMEOUT_MS environment variable
+- de5b0905: fix: Deprecate raw iterators and switch to forEach iterators
+
+## 1.10.4
+
+### Patch Changes
+
+- addf097c: chore: update @farcaster/hub-nodejs
+
+## 1.10.3
+
+### Patch Changes
+
+- 9bcaa9c1: Run via pm2 process supervisor
+- a8b7dfcb: fix: Replace hot-shots with @figma/hot-shots
+- Updated dependencies [5703d339]
+  - @farcaster/hub-nodejs@0.11.2
+
 ## 1.10.2
 
 ### Patch Changes

@@ -4,6 +4,7 @@ import cron from "node-cron";
 import Engine from "../engine/index.js";
 import { logger } from "../../utils/logger.js";
 import { statsd } from "../../utils/statsd.js";
+import { sleep } from "../../utils/crypto.js";
 
 export const DEFAULT_PRUNE_MESSAGES_JOB_CRON = "0 */2 * * *"; // Every two hours
 
@@ -17,13 +18,17 @@ export class PruneMessagesJobScheduler {
   private _engine: Engine;
   private _cronTask?: cron.ScheduledTask;
   private _running = false;
+  private _getSyncTrieQSizeFn: () => number;
 
-  constructor(engine: Engine) {
+  constructor(engine: Engine, getSyncTrieQSizeFn: () => number) {
     this._engine = engine;
+    this._getSyncTrieQSizeFn = getSyncTrieQSizeFn;
   }
 
   start(cronSchedule?: string) {
-    this._cronTask = cron.schedule(cronSchedule ?? DEFAULT_PRUNE_MESSAGES_JOB_CRON, () => this.doJobs());
+    this._cronTask = cron.schedule(cronSchedule ?? DEFAULT_PRUNE_MESSAGES_JOB_CRON, () => this.doJobs(), {
+      timezone: "Etc/UTC",
+    });
 
     // Log the DB Size at startup
     setTimeout(() => {
@@ -59,6 +64,7 @@ export class PruneMessagesJobScheduler {
     log.info({}, "starting prune messages job");
     const start = Date.now();
     this._running = true;
+    let totalPruned = 0;
 
     let finished = false;
     let pageToken: Uint8Array | undefined;
@@ -75,11 +81,18 @@ export class PruneMessagesJobScheduler {
       }
 
       for (const fid of fids) {
-        await this._engine.pruneMessages(fid);
+        totalPruned += (await this._engine.pruneMessages(fid)).unwrapOr(0);
+      }
+
+      // Sleep for a bit avoid overloading the Merkle Trie
+      const syncTrieQSize = this._getSyncTrieQSizeFn();
+      if (syncTrieQSize > 10_000) {
+        log.info({ syncTrieQSize }, "sync trie Q is large, sleeping for 30s");
+        await sleep(30_000);
       }
     } while (!finished);
 
-    log.info({ timeTakenMs: Date.now() - start }, "finished prune messages job");
+    log.info({ totalPruned, timeTakenMs: Date.now() - start }, "finished prune messages job");
     this._running = false;
 
     this.logDbSize();

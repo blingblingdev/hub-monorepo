@@ -12,7 +12,7 @@ import {
   UserMessagePostfixMax,
 } from "../../storage/db/types.js";
 import { logger } from "../../utils/logger.js";
-import { getStatusdInitialization } from "../../utils/statsd.js";
+import { getStatsdInitialization } from "../../utils/statsd.js";
 import { messageDecode } from "../../storage/db/message.js";
 
 /**
@@ -31,7 +31,6 @@ export type NodeMetadata = {
 };
 
 const log = logger.child({ component: "SyncMerkleTrie" });
-const workerLog = logger.child({ component: "SyncMerkleTrieWorker" });
 
 export interface MerkleTrieKV {
   key: Uint8Array;
@@ -52,6 +51,7 @@ export interface MerkleTrieInterface {
   items(): Promise<number>;
   rootHash(): Promise<string>;
   commitToDb(): Promise<void>;
+  loggerFlush(): Promise<void>;
   unloadChildrenAtPrefix(prefix: Uint8Array): Promise<void>;
   stop(): Promise<void>;
 }
@@ -113,7 +113,14 @@ class MerkleTrie {
     } else {
       const workerPath = new URL("../../../build/network/sync/merkleTrieWorker.js", import.meta.url);
       this._worker = new Worker(workerPath, {
-        workerData: { statsdInitialization: getStatusdInitialization(), dbPath: this._db.location },
+        workerData: { statsdInitialization: getStatsdInitialization(), dbPath: this._db.location },
+      });
+      // Loggers start off buffered, and they are "flushed" when the startup checks and progress
+      // bars finish. This is to avoid logging to the console before the progress bars are set up
+      // So, we need to listen for the flush event and call the logger.flush method in the worker
+      // thread
+      logger.onFlushListener(() => {
+        this.callMethod("loggerFlush");
       });
     }
 
@@ -162,11 +169,6 @@ class MerkleTrie {
         this._worker.postMessage({
           dbKeyValuesCallId: event.dbKeyValuesCallId,
         });
-      } else if (event.log) {
-        // Log event from the libp2p worker thread.
-        const { level, logObj, message } = event.log;
-        // biome-ignore lint/suspicious/noExplicitAny: <explanation>
-        (workerLog as any)[level](logObj, message);
       } else {
         // Result of a method call. Pick the correct method call from the map and resolve/reject the promise
         const result = event;
@@ -237,69 +239,54 @@ class MerkleTrie {
     let count = 0;
 
     // Messages
-    await this._db.forEachIteratorByPrefix(
-      Buffer.from([RootPrefix.User]),
-      async (key, value) => {
-        const postfix = (key as Buffer).readUint8(1 + FID_BYTES);
-        if (postfix < UserMessagePostfixMax) {
-          const message = Result.fromThrowable(
-            () => messageDecode(new Uint8Array(value as Buffer)),
-            (e) => e as HubError,
-          )();
-          if (message.isOk() && message.value.hash.length === HASH_LENGTH) {
-            await this.insert(SyncId.fromMessage(message.value));
-            count += 1;
-            if (count % 10_000 === 0) {
-              log.info({ count }, "Rebuilding Merkle Trie");
-            }
-          }
-        }
-      },
-      {},
-      1 * 60 * 60 * 1000,
-    );
-    log.info({ count }, "Rebuilt messages trie");
-    // On chain events
-    await this._db.forEachIteratorByPrefix(
-      Buffer.from([RootPrefix.OnChainEvent]),
-      async (key, value) => {
-        const postfix = (key as Buffer).readUint8(1);
-        if (postfix === OnChainEventPostfix.OnChainEvents) {
-          const event = Result.fromThrowable(
-            () => OnChainEvent.decode(new Uint8Array(value as Buffer)),
-            (e) => e as HubError,
-          )();
-          if (event.isOk()) {
-            await this.insert(SyncId.fromOnChainEvent(event.value));
-            count += 1;
-            if (count % 10_000 === 0) {
-              log.info({ count }, "Rebuilding Merkle Trie (events)");
-            }
-          }
-        }
-      },
-      {},
-      1 * 60 * 60 * 1000,
-    );
-    log.info({ count }, "Rebuilt events trie");
-    await this._db.forEachIteratorByPrefix(
-      Buffer.from([RootPrefix.FNameUserNameProof]),
-      async (key, value) => {
-        const proof = Result.fromThrowable(
-          () => UserNameProof.decode(new Uint8Array(value as Buffer)),
+    await this._db.forEachIteratorByPrefix(Buffer.from([RootPrefix.User]), async (key, value) => {
+      const postfix = (key as Buffer).readUint8(1 + FID_BYTES);
+      if (postfix < UserMessagePostfixMax) {
+        const message = Result.fromThrowable(
+          () => messageDecode(new Uint8Array(value as Buffer)),
           (e) => e as HubError,
         )();
-        if (proof.isOk()) {
-          await this.insert(SyncId.fromFName(proof.value));
+        if (message.isOk() && message.value.hash.length === HASH_LENGTH) {
+          await this.insert(SyncId.fromMessage(message.value));
           count += 1;
           if (count % 10_000 === 0) {
-            log.info({ count }, "Rebuilding Merkle Trie (proofs)");
+            log.info({ count }, "Rebuilding Merkle Trie");
           }
         }
-      },
-      {},
-      1 * 60 * 60 * 1000,
-    );
+      }
+    });
+    log.info({ count }, "Rebuilt messages trie");
+    // On chain events
+    await this._db.forEachIteratorByPrefix(Buffer.from([RootPrefix.OnChainEvent]), async (key, value) => {
+      const postfix = (key as Buffer).readUint8(1);
+      if (postfix === OnChainEventPostfix.OnChainEvents) {
+        const event = Result.fromThrowable(
+          () => OnChainEvent.decode(new Uint8Array(value as Buffer)),
+          (e) => e as HubError,
+        )();
+        if (event.isOk()) {
+          await this.insert(SyncId.fromOnChainEvent(event.value));
+          count += 1;
+          if (count % 10_000 === 0) {
+            log.info({ count }, "Rebuilding Merkle Trie (events)");
+          }
+        }
+      }
+    });
+    log.info({ count }, "Rebuilt events trie");
+    await this._db.forEachIteratorByPrefix(Buffer.from([RootPrefix.FNameUserNameProof]), async (key, value) => {
+      const proof = Result.fromThrowable(
+        () => UserNameProof.decode(new Uint8Array(value as Buffer)),
+        (e) => e as HubError,
+      )();
+      if (proof.isOk()) {
+        await this.insert(SyncId.fromFName(proof.value));
+        count += 1;
+        if (count % 10_000 === 0) {
+          log.info({ count }, "Rebuilding Merkle Trie (proofs)");
+        }
+      }
+    });
     log.info({ count }, "Rebuilt fnmames trie");
   }
 
